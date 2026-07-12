@@ -1,5 +1,6 @@
 /**
  * Telegram media and text extraction helpers
+ * Zones: telegram inbound, media groups, filesystem paths
  * Normalizes inbound Telegram messages into reusable file, text, id, history, and media-group metadata
  */
 
@@ -28,10 +29,40 @@ export interface TelegramVoice {
   mime_type?: string;
 }
 
+export interface TelegramRichMessage {
+  blocks?: unknown[];
+}
+
+export interface TelegramMessageUser {
+  id?: number;
+  is_bot?: boolean;
+  first_name?: string;
+  last_name?: string;
+  username?: string;
+}
+
+export interface TelegramMessageForwardOrigin {
+  type?: string;
+  sender_user?: TelegramMessageUser;
+  sender_user_name?: string;
+  sender_chat?: { title?: string; username?: string; id?: number };
+  chat?: { title?: string; username?: string; id?: number };
+  author_signature?: string;
+}
+
 export interface TelegramReplyToMessage {
   message_id?: number;
+  from?: TelegramMessageUser;
   text?: string;
   caption?: string;
+  rich_message?: TelegramRichMessage;
+  photo?: TelegramPhotoSize[];
+  document?: TelegramDocument;
+  video?: TelegramVideo;
+  audio?: TelegramAudio;
+  voice?: TelegramVoice;
+  animation?: TelegramAnimation;
+  sticker?: TelegramSticker;
 }
 
 export interface TelegramSticker {
@@ -40,8 +71,13 @@ export interface TelegramSticker {
 
 export interface TelegramMediaMessage {
   message_id: number;
+  from?: TelegramMessageUser;
+  forward_origin?: TelegramMessageForwardOrigin;
+  forward_from?: TelegramMessageUser;
+  forward_sender_name?: string;
   text?: string;
   caption?: string;
+  rich_message?: TelegramRichMessage;
   reply_to_message?: TelegramReplyToMessage;
   media_group_id?: string;
   photo?: TelegramPhotoSize[];
@@ -56,6 +92,7 @@ export interface TelegramMediaMessage {
 export interface TelegramMediaGroupMessage {
   message_id: number;
   chat: { id: number };
+  message_thread_id?: number;
   media_group_id?: string;
 }
 
@@ -172,10 +209,96 @@ function isImageMimeType(mimeType: string | undefined): boolean {
   return mimeType?.toLowerCase().startsWith("image/") ?? false;
 }
 
+function getObjectField(value: unknown, field: string): unknown {
+  if (typeof value !== "object" || value === null || !(field in value)) {
+    return undefined;
+  }
+  return Reflect.get(value, field);
+}
+
+function joinRichTextParts(parts: string[], separator = ""): string {
+  return parts.filter(Boolean).join(separator).trim();
+}
+
+function extractTelegramRichText(value: unknown): string {
+  if (typeof value === "string") return value;
+  if (Array.isArray(value)) {
+    return joinRichTextParts(value.map(extractTelegramRichText));
+  }
+  if (typeof value !== "object" || value === null) return "";
+  const text = getObjectField(value, "text");
+  if (text !== undefined) return extractTelegramRichText(text);
+  const expression = getObjectField(value, "expression");
+  if (typeof expression === "string") return expression;
+  const alternativeText = getObjectField(value, "alternative_text");
+  if (typeof alternativeText === "string") return alternativeText;
+  return "";
+}
+
+function extractTelegramRichBlockText(block: unknown): string {
+  if (typeof block !== "object" || block === null) return "";
+  const directText = extractTelegramRichText(getObjectField(block, "text"));
+  if (directText) return directText;
+  const summary = extractTelegramRichText(getObjectField(block, "summary"));
+  const nestedBlocks = extractTelegramRichMessageBlocksText(
+    getObjectField(block, "blocks"),
+  );
+  const items = getObjectField(block, "items");
+  const itemText = Array.isArray(items)
+    ? items
+        .map((item) => {
+          const label = getObjectField(item, "label");
+          const body = extractTelegramRichMessageBlocksText(
+            getObjectField(item, "blocks"),
+          );
+          return typeof label === "string" && body ? `${label} ${body}` : body;
+        })
+        .filter(Boolean)
+        .join("\n")
+    : "";
+  const cells = getObjectField(block, "cells");
+  const cellText = Array.isArray(cells)
+    ? cells
+        .map((row) =>
+          Array.isArray(row)
+            ? row
+                .map((cell) =>
+                  extractTelegramRichText(getObjectField(cell, "text")),
+                )
+                .filter(Boolean)
+                .join(" | ")
+            : "",
+        )
+        .filter(Boolean)
+        .join("\n")
+    : "";
+  const caption = extractTelegramRichText(getObjectField(block, "caption"));
+  return joinRichTextParts(
+    [summary, nestedBlocks, itemText, cellText, caption],
+    "\n",
+  );
+}
+
+function extractTelegramRichMessageBlocksText(blocks: unknown): string {
+  if (!Array.isArray(blocks)) return "";
+  return joinRichTextParts(blocks.map(extractTelegramRichBlockText), "\n\n");
+}
+
+function extractTelegramRichMessageText(
+  richMessage: TelegramRichMessage | undefined,
+): string {
+  return extractTelegramRichMessageBlocksText(richMessage?.blocks);
+}
+
 export function extractTelegramMessageText(
   message: TelegramMediaMessage,
 ): string {
-  return (message.text || message.caption || "").trim();
+  return (
+    extractTelegramRichMessageText(message.rich_message) ||
+    message.text ||
+    message.caption ||
+    ""
+  ).trim();
 }
 
 function truncateTelegramReplyContextText(text: string): string {
@@ -183,10 +306,44 @@ function truncateTelegramReplyContextText(text: string): string {
   return `${text.slice(0, TELEGRAM_REPLY_CONTEXT_MAX_LENGTH).trimEnd()}…`;
 }
 
+function formatTelegramUser(user: TelegramMessageUser | undefined): string | undefined {
+  if (!user) return undefined;
+  if (user.username) return user.username;
+  if (typeof user.id === "number") return String(user.id);
+  const name = [user.first_name, user.last_name].filter(Boolean).join(" ").trim();
+  return name || undefined;
+}
+
+function formatTelegramForwardOriginIdentifier(
+  message: TelegramMediaMessage,
+): string | undefined {
+  const origin = message.forward_origin;
+  const user = origin?.sender_user ?? message.forward_from;
+  if (user?.username) return user.username;
+  if (typeof user?.id === "number") return String(user.id);
+  const chat = origin?.sender_chat ?? origin?.chat;
+  if (chat?.username) return chat.username;
+  if (typeof chat?.id === "number") return String(chat.id);
+  return origin?.sender_user_name ?? message.forward_sender_name;
+}
+
+export function extractTelegramForwardContextText(
+  message: TelegramMediaMessage,
+  allowedUserId?: number,
+): string {
+  const originUser = message.forward_origin?.sender_user ?? message.forward_from;
+  const isOwnerOrigin =
+    typeof allowedUserId === "number" && originUser?.id === allowedUserId;
+  const origin = formatTelegramForwardOriginIdentifier(message);
+  if (!origin || isOwnerOrigin) return "";
+  return `from: ${origin}`;
+}
+
 export function extractTelegramReplyContextText(
   message: TelegramMediaMessage,
 ): string {
   const quoted = (
+    extractTelegramRichMessageText(message.reply_to_message?.rich_message) ||
     message.reply_to_message?.text ||
     message.reply_to_message?.caption ||
     ""
@@ -194,13 +351,44 @@ export function extractTelegramReplyContextText(
   return quoted ? truncateTelegramReplyContextText(quoted) : "";
 }
 
+export function buildTelegramReplyContextBlock(
+  message: TelegramMediaMessage,
+  replyFiles: Pick<DownloadedTelegramFile, "path">[] = [],
+): string {
+  const from = formatTelegramUser(message.reply_to_message?.from);
+  const header = from ? `[reply|from:${from}]` : "[reply]";
+  const text = extractTelegramReplyContextText(message);
+  const dirs = [...new Set(replyFiles.map((file) => dirname(file.path)))];
+  const sameDir = dirs.length === 1;
+  const attachmentHeader = sameDir
+    ? `[attachments${from ? `|from:${from}` : ""}] ${dirs[0]}`
+    : `[attachments${from ? `|from:${from}` : ""}]`;
+  const fileLines = sameDir
+    ? replyFiles.map((file) => `- /${basename(file.path)}`)
+    : replyFiles.map((file) => `- ${file.path}`);
+  const replyBlock = text ? `${header} ${text}` : header;
+  if (fileLines.length > 0) {
+    return `${replyBlock}\n\n${attachmentHeader}\n${fileLines.join("\n")}`;
+  }
+  if (text) return replyBlock;
+  return "";
+}
+
 export function appendTelegramReplyContext(
   text: string,
   replyContext: string,
 ): string {
   if (!replyContext) return text;
-  const replyBlock = `[reply] ${replyContext}`;
-  return text ? `${text}\n\n${replyBlock}` : `_\n\n${replyBlock}`;
+  return text ? `${text}\n\n${replyContext}` : `_\n\n${replyContext}`;
+}
+
+export function appendTelegramForwardContext(
+  text: string,
+  forwardContext: string,
+): string {
+  if (!forwardContext) return text;
+  const forwardBlock = `[forward|${forwardContext.replace(/:\s+/g, ":")}]`;
+  return text ? `\n\n${forwardBlock} ${text}` : `\n\n${forwardBlock}`;
 }
 
 export function extractTelegramMessagePromptText(
@@ -208,7 +396,7 @@ export function extractTelegramMessagePromptText(
 ): string {
   return appendTelegramReplyContext(
     extractTelegramMessageText(message),
-    extractTelegramReplyContextText(message),
+    buildTelegramReplyContextBlock(message),
   );
 }
 
@@ -226,7 +414,7 @@ export function extractTelegramMessagesPromptText(
   if (!firstMessage) return text;
   return appendTelegramReplyContext(
     text,
-    extractTelegramReplyContextText(firstMessage),
+    buildTelegramReplyContextBlock(firstMessage),
   );
 }
 
@@ -234,6 +422,27 @@ export function extractFirstTelegramMessageText(
   messages: TelegramMediaMessage[],
 ): string {
   return messages.map(extractTelegramMessageText).find(Boolean) ?? "";
+}
+
+export function hasTelegramMessagePromptContent(
+  message: TelegramMediaMessage,
+): boolean {
+  return (
+    !!extractTelegramMessageText(message) ||
+    (Array.isArray(message.photo) && message.photo.length > 0) ||
+    !!message.document ||
+    !!message.video ||
+    !!message.audio ||
+    !!message.voice ||
+    !!message.animation ||
+    !!message.sticker
+  );
+}
+
+export function hasTelegramMessagesPromptContent(
+  messages: TelegramMediaMessage[],
+): boolean {
+  return messages.some(hasTelegramMessagePromptContent);
 }
 
 export function collectTelegramMessageIds(
@@ -246,7 +455,11 @@ export function getTelegramMediaGroupKey(
   message: TelegramMediaGroupMessage,
 ): string | undefined {
   if (!message.media_group_id) return undefined;
-  return `${message.chat.id}:${message.media_group_id}`;
+  const threadKey =
+    typeof message.message_thread_id === "number"
+      ? `thread:${message.message_thread_id}`
+      : "private";
+  return `${message.chat.id}:${threadKey}:${message.media_group_id}`;
 }
 
 export function removePendingTelegramMediaGroupMessages<
@@ -298,6 +511,7 @@ export function queueTelegramMediaGroupMessage<
     if (!state) return;
     options.dispatchMessages(state.messages, state.context);
   }, options.debounceMs);
+  existing.flushTimer.unref?.();
   options.groups.set(key, existing);
   return true;
 }
@@ -462,6 +676,7 @@ export function collectTelegramFileInfos(
         isImage: false,
       });
     }
+    // Generic audio files (e.g. MP3 uploads) — can also trigger voice replies in "mirror" mode
     if (message.audio) {
       const fileName =
         message.audio.file_name ||
@@ -477,6 +692,8 @@ export function collectTelegramFileInfos(
         isImage: false,
       });
     }
+
+    // Voice messages (recorded via microphone) — primary trigger for "mirror" voice reply mode
     if (message.voice) {
       files.push({
         file_id: message.voice.file_id,

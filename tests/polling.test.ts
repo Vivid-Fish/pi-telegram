@@ -1,5 +1,5 @@
 /**
- * Regression tests for the Telegram polling domain
+ * Regression tests for the Telegram polling runtime domain
  * Covers polling request helpers, stop conditions, and the long-poll loop runtime in one suite
  */
 
@@ -7,6 +7,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  applyTelegramThreadCapability,
   buildTelegramInitialSyncRequest,
   buildTelegramLongPollRequest,
   createTelegramPollingActivityReader,
@@ -14,11 +15,14 @@ import {
   createTelegramPollingControllerRuntime,
   createTelegramPollingControllerState,
   createTelegramPollLoopRunner,
+  createTelegramThreadAwarePollingPorts,
   getLatestTelegramUpdateId,
+  isTelegramGetUpdatesConflictError,
   isTelegramPollingControllerActive,
   runTelegramPollLoop,
   shouldStartTelegramPolling,
   shouldStopTelegramPolling,
+  sleepTelegramPollingRetry,
   startTelegramPollingRuntime,
   stopTelegramPollingRuntime,
   TELEGRAM_ALLOWED_UPDATES,
@@ -54,6 +58,191 @@ test("Polling helpers extract the latest update id", () => {
   assert.equal(
     getLatestTelegramUpdateId([{ update_id: 1 }, { update_id: 7 }]),
     7,
+  );
+});
+
+test("Thread-aware polling blocks follower takeover during Threaded Mode downgrade", async () => {
+  const events: Array<{ category: string; details?: Record<string, unknown> }> = [];
+  const callApi = async <TResponse,>(): Promise<TResponse> => ({}) as TResponse;
+  const store = {
+    async load() {},
+    async persist() {},
+    getBotState() {
+      return { threadMode: "disabled" as const };
+    },
+    setBotState() {},
+    list() {
+      return [
+        {
+          status: "active",
+          target: { chatId: 42, threadId: 7 },
+        },
+      ];
+    },
+  };
+  const ports = createTelegramThreadAwarePollingPorts({
+    getAllowedUserId: () => 42,
+    callApi,
+    topicTargetStore: store,
+    isBusConfigured: () => true,
+    isBusRuntimeEnabled: () => false,
+    isTopicModeUnavailableError: () => false,
+    getPollingStartedWithTelegramBus: () => false,
+    setPollingStartedWithTelegramBus() {},
+    setForceFreshLeaderThreadOnNextStart() {},
+    setTopicModeUnavailable() {},
+    startClassicPolling() {},
+    async stopClassicPolling() {},
+    async startBusLeaderPolling() {},
+    async stopBusLeaderPolling() {},
+    startLeaderHealth() {},
+    stopLeaderHealth() {},
+    registerFollowerWithLeader: async () => true,
+    stopFollowerRegistration() {},
+    recordEvent(category, _error, details) {
+      events.push({ category, details });
+    },
+  });
+
+  await assert.rejects(
+    ports.registerFollowerWithOwner?.(TEST_CONTEXT, { pid: 1 }),
+    /current leader remains the classic polling owner/u,
+  );
+  assert.deepEqual(events, [
+    {
+      category: "bus",
+      details: {
+        phase: "follower-register-thread-mode-disabled",
+        reason: "active-thread-bindings-present",
+      },
+    },
+  ]);
+});
+
+test("Thread capability downgrade retries classic restore after failure", async () => {
+  let state: {
+    threadMode?: "enabled" | "disabled" | "unknown";
+    updatedAtMs?: number;
+    lastReconcileAction?: string;
+  } = {
+    threadMode: "enabled",
+    lastReconcileAction: "capability-monitor-enabled",
+  };
+  let pollingStartedWithBus = true;
+  let classicStarts = 0;
+  let persisted = 0;
+  const events: Array<{ category: string; details?: Record<string, unknown> }> = [];
+  const store = {
+    async load() {},
+    async persist() {
+      persisted += 1;
+    },
+    getBotState() {
+      return state;
+    },
+    setBotState(next: typeof state) {
+      state = { ...state, ...next };
+    },
+    list() {
+      return [
+        {
+          status: "active",
+          target: { chatId: 42, threadId: 7 },
+        },
+      ];
+    },
+  };
+  const deps = {
+    getAllowedUserId: () => 42,
+    callApi: async <TResponse,>(): Promise<TResponse> => ({}) as TResponse,
+    topicTargetStore: store,
+    isBusConfigured: () => true,
+    ownsLock: () => true,
+    getPollingStartedWithTelegramBus: () => pollingStartedWithBus,
+    setPollingStartedWithTelegramBus(started: boolean) {
+      pollingStartedWithBus = started;
+    },
+    setTopicModeUnavailable() {},
+    stopFollowerRegistration() {},
+    startClassicPolling() {
+      classicStarts += 1;
+      if (classicStarts === 1) throw new Error("classic unavailable");
+    },
+    async stopClassicPolling() {},
+    async startBusPolling() {},
+    async stopBusPolling() {},
+    startLeaderHealth() {},
+    stopLeaderHealth() {},
+    isTopicModeUnavailableError: () => false,
+    updateStatus() {},
+    recordEvent(category: string, _error: unknown, details?: Record<string, unknown>) {
+      events.push({ category, details });
+    },
+  };
+
+  await applyTelegramThreadCapability(
+    TEST_CONTEXT,
+    false,
+    "capability-monitor-disabled-confirmed",
+    deps,
+  );
+  assert.equal(classicStarts, 1);
+  assert.equal(
+    state.lastReconcileAction,
+    "capability-monitor-disabled-confirmed-classic-restore-failed",
+  );
+  assert.equal(pollingStartedWithBus, false);
+
+  await applyTelegramThreadCapability(
+    TEST_CONTEXT,
+    false,
+    "capability-monitor-disabled-confirmed",
+    deps,
+  );
+  assert.equal(classicStarts, 2);
+  assert.equal(state.lastReconcileAction, "capability-monitor-disabled-confirmed");
+  assert.equal(persisted >= 3, true);
+  assert.equal(events[0].details?.phase, "capability-monitor-disabled-confirmed-classic-restore");
+});
+
+test("Thread-aware polling still allows classic takeover path without thread bindings", async () => {
+  const callApi = async <TResponse,>(): Promise<TResponse> => ({}) as TResponse;
+  const store = {
+    async load() {},
+    async persist() {},
+    getBotState() {
+      return { threadMode: "disabled" as const };
+    },
+    setBotState() {},
+    list() {
+      return [];
+    },
+  };
+  const ports = createTelegramThreadAwarePollingPorts({
+    getAllowedUserId: () => 42,
+    callApi,
+    topicTargetStore: store,
+    isBusConfigured: () => true,
+    isBusRuntimeEnabled: () => false,
+    isTopicModeUnavailableError: () => false,
+    getPollingStartedWithTelegramBus: () => false,
+    setPollingStartedWithTelegramBus() {},
+    setForceFreshLeaderThreadOnNextStart() {},
+    setTopicModeUnavailable() {},
+    startClassicPolling() {},
+    async stopClassicPolling() {},
+    async startBusLeaderPolling() {},
+    async stopBusLeaderPolling() {},
+    startLeaderHealth() {},
+    stopLeaderHealth() {},
+    registerFollowerWithLeader: async () => true,
+    stopFollowerRegistration() {},
+    recordEvent() {},
+  });
+
+  assert.equal(
+    await ports.registerFollowerWithOwner?.(TEST_CONTEXT, { pid: 1 }),
+    undefined,
   );
 });
 
@@ -115,7 +304,8 @@ test("Polling runtime starts and stops polling through state ports", async () =>
   assert.equal(!!pollingPromise, true);
   assert.equal(!!pollingController, true);
   const stopPromise = stopTelegramPollingRuntime(deps);
-  assert.equal(pollingController, undefined);
+  assert.equal(pollingController?.signal.aborted, true);
+  assert.equal(!!pollingController, true);
   finishPollLoop?.();
   await stopPromise;
   assert.deepEqual(events, [
@@ -124,12 +314,139 @@ test("Polling runtime starts and stops polling through state ports", async () =>
     "promise:set",
     "status:ctx",
     "typing:stop",
-    "controller:clear",
     "promise:clear",
     "controller:clear",
     "status:ctx",
-    "promise:clear",
   ]);
+});
+
+test("Polling runtime still aborts and settles when typing cleanup fails", async () => {
+  const events: string[] = [];
+  let pollingPromise: Promise<void> | undefined;
+  let pollingController: AbortController | undefined;
+  let finishPollLoop: (() => void) | undefined;
+  const deps = {
+    hasBotToken: () => true,
+    getPollingPromise: () => pollingPromise,
+    setPollingPromise: (promise: Promise<void> | undefined) => {
+      pollingPromise = promise;
+      events.push(`promise:${promise ? "set" : "clear"}`);
+    },
+    getPollingController: () => pollingController,
+    setPollingController: (controller: AbortController | undefined) => {
+      pollingController = controller;
+      events.push(`controller:${controller ? "set" : "clear"}`);
+    },
+    stopTypingLoop: () => {
+      events.push("typing:throw");
+      throw new Error("typing cleanup failed");
+    },
+    runPollLoop: async (_ctx: string, signal: AbortSignal) => {
+      await new Promise<void>((resolve) => {
+        finishPollLoop = () => {
+          events.push(`run-finish:${signal.aborted}`);
+          resolve();
+        };
+      });
+    },
+    updateStatus: () => {},
+    recordRuntimeEvent: (
+      category: string,
+      error: unknown,
+      details?: Record<string, unknown>,
+    ) => {
+      events.push(
+        `${category}:${error instanceof Error ? error.message : String(error)}:${details?.phase}`,
+      );
+    },
+  };
+  startTelegramPollingRuntime("ctx", deps);
+  const stopPromise = stopTelegramPollingRuntime(deps);
+  assert.equal(pollingController?.signal.aborted, true);
+  finishPollLoop?.();
+  await stopPromise;
+  assert.deepEqual(events, [
+    "controller:set",
+    "promise:set",
+    "typing:throw",
+    "polling:typing cleanup failed:typing-stop",
+    "run-finish:true",
+    "promise:clear",
+    "controller:clear",
+  ]);
+});
+
+test("Polling runtime ignores stale-context status failures during cleanup", async () => {
+  let pollingPromise: Promise<void> | undefined;
+  let pollingController: AbortController | undefined;
+  let statusCalls = 0;
+  const runtimeEvents: string[] = [];
+  const deps = {
+    hasBotToken: () => true,
+    getPollingPromise: () => pollingPromise,
+    setPollingPromise: (promise: Promise<void> | undefined) => {
+      pollingPromise = promise;
+    },
+    getPollingController: () => pollingController,
+    setPollingController: (controller: AbortController | undefined) => {
+      pollingController = controller;
+    },
+    stopTypingLoop: () => {},
+    runPollLoop: async () => {},
+    updateStatus: () => {
+      statusCalls += 1;
+      if (statusCalls > 1) throw new Error("stale ctx");
+    },
+    recordRuntimeEvent: (
+      category: string,
+      error: unknown,
+      details?: Record<string, unknown>,
+    ) => {
+      const message = error instanceof Error ? error.message : String(error);
+      runtimeEvents.push(`${category}:${message}:${details?.phase}`);
+    },
+  };
+  startTelegramPollingRuntime("ctx", deps);
+  await pollingPromise;
+  assert.equal(statusCalls, 2);
+  assert.equal(pollingPromise, undefined);
+  assert.equal(pollingController, undefined);
+  assert.deepEqual(runtimeEvents, ["polling:stale ctx:status-update"]);
+});
+
+test("Polling runtime ignores stale-context status failures during start", () => {
+  let pollingPromise: Promise<void> | undefined;
+  let pollingController: AbortController | undefined;
+  const runtimeEvents: string[] = [];
+  const deps = {
+    hasBotToken: () => true,
+    getPollingPromise: () => pollingPromise,
+    setPollingPromise: (promise: Promise<void> | undefined) => {
+      pollingPromise = promise;
+    },
+    getPollingController: () => pollingController,
+    setPollingController: (controller: AbortController | undefined) => {
+      pollingController = controller;
+    },
+    stopTypingLoop: () => {},
+    runPollLoop: async () => {},
+    updateStatus: () => {
+      throw new Error("stale ctx");
+    },
+    recordRuntimeEvent: (
+      category: string,
+      error: unknown,
+      details?: Record<string, unknown>,
+    ) => {
+      const message = error instanceof Error ? error.message : String(error);
+      runtimeEvents.push(`${category}:${message}:${details?.phase}`);
+    },
+  };
+
+  assert.doesNotThrow(() => startTelegramPollingRuntime("ctx", deps));
+  assert.equal(!!pollingPromise, true);
+  assert.equal(!!pollingController, true);
+  assert.deepEqual(runtimeEvents, ["polling:stale ctx:status-update"]);
 });
 
 test("Polling controller owns polling promise and abort-controller state", async () => {
@@ -253,6 +570,42 @@ test("Poll loop runner binds config, status, and transport ports", async () => {
   assert.deepEqual(events, ["deleteWebhook", "handle:ctx:6", "persist:6"]);
 });
 
+test("Poll loop runner ignores stale-context status failures while retrying", async () => {
+  const config = { botToken: "123:abc", lastUpdateId: 1 };
+  const events: string[] = [];
+  const runtimeEvents: string[] = [];
+  let calls = 0;
+  const runPollLoop = createTelegramPollLoopRunner({
+    getConfig: () => config,
+    deleteWebhook: async () => {},
+    getUpdates: async () => {
+      calls += 1;
+      if (calls === 1) throw new Error("network down");
+      throw new DOMException("stop", "AbortError");
+    },
+    persistConfig: async () => {},
+    handleUpdate: async () => {},
+    updateStatus: (_ctx: string, message?: string) => {
+      events.push(`status:${message ?? "ok"}`);
+      throw new Error("stale ctx");
+    },
+    sleep: async (ms) => {
+      events.push(`sleep:${ms}`);
+    },
+    recordRuntimeEvent: (category, error, details) => {
+      const message = error instanceof Error ? error.message : String(error);
+      runtimeEvents.push(`${category}:${message}:${details?.phase}`);
+    },
+  });
+  await runPollLoop("ctx", new AbortController().signal);
+  assert.deepEqual(events, ["status:network down", "sleep:3000", "status:ok"]);
+  assert.deepEqual(runtimeEvents, [
+    "polling:network down:loop",
+    "polling:stale ctx:status-update",
+    "polling:stale ctx:status-update",
+  ]);
+});
+
 test("Poll loop initializes lastUpdateId and processes updates", async () => {
   const handled: number[] = [];
   const config: { botToken: string; lastUpdateId?: number } = {
@@ -373,6 +726,93 @@ test("Poll loop skips repeatedly failing updates after the configured threshold"
     "polling:handler failed:handleUpdate:1",
     "polling:handler failed:handleUpdate:2",
   ]);
+});
+
+test("Polling retry sleep resolves immediately when aborted", async () => {
+  const controller = new AbortController();
+  controller.abort();
+  await sleepTelegramPollingRetry(3000, controller.signal);
+});
+
+test("Poll loop stops without status reset when aborted during retry sleep", async () => {
+  const config = { botToken: "123:abc", lastUpdateId: 1 };
+  const controller = new AbortController();
+  const statusMessages: string[] = [];
+  let calls = 0;
+  await runTelegramPollLoop({
+    ctx: TEST_CONTEXT,
+    signal: controller.signal,
+    config,
+    deleteWebhook: async () => {},
+    getUpdates: async () => {
+      calls += 1;
+      throw new Error("network down");
+    },
+    persistConfig: async () => {},
+    handleUpdate: async () => {},
+    onErrorStatus: (message) => {
+      statusMessages.push(`error:${message}`);
+    },
+    onStatusReset: () => {
+      statusMessages.push("unexpected:reset");
+    },
+    sleep: async (_ms, signal) => {
+      assert.equal(signal, controller.signal);
+      controller.abort();
+    },
+  });
+  assert.equal(calls, 1);
+  assert.deepEqual(statusMessages, ["error:network down"]);
+});
+
+test("Poll loop suppresses getUpdates conflicts while another long poll drains", async () => {
+  const config = { botToken: "123:abc", lastUpdateId: 1 };
+  const statusMessages: string[] = [];
+  const runtimeEvents: string[] = [];
+  let calls = 0;
+  await runTelegramPollLoop({
+    ctx: TEST_CONTEXT,
+    signal: new AbortController().signal,
+    config,
+    deleteWebhook: async () => {},
+    getUpdates: async () => {
+      calls += 1;
+      if (calls <= 4) {
+        throw new Error(
+          "Telegram API getUpdates failed: HTTP 409: Conflict: terminated by other getUpdates request; make sure that only one bot instance is running",
+        );
+      }
+      throw new DOMException("stop", "AbortError");
+    },
+    persistConfig: async () => {},
+    handleUpdate: async () => {},
+    onErrorStatus: (message) => {
+      statusMessages.push(`error:${message}`);
+    },
+    onStatusReset: () => {
+      statusMessages.push("reset");
+    },
+    sleep: async (ms) => {
+      statusMessages.push(`sleep:${ms}`);
+    },
+    recordRuntimeEvent: (category, error, details) => {
+      const message = error instanceof Error ? error.message : String(error);
+      runtimeEvents.push(`${category}:${message}:${details?.phase}`);
+    },
+  });
+  assert.equal(
+    isTelegramGetUpdatesConflictError(
+      new Error("HTTP 409: Conflict: terminated by other getUpdates request"),
+    ),
+    true,
+  );
+  assert.deepEqual(statusMessages, [
+    "sleep:1000",
+    "sleep:1000",
+    "sleep:3000",
+    "sleep:3000",
+  ]);
+  assert.equal(runtimeEvents.length, 4);
 });
 
 test("Poll loop reports retryable errors and sleeps before retrying", async () => {

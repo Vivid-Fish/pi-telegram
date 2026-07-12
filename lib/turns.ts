@@ -1,5 +1,6 @@
 /**
  * Telegram turn-building helpers
+ * Zones: telegram inbound, pi agent prompt content, queue
  * Owns prompt-turn summary and content construction so queued Telegram turns are assembled consistently
  */
 
@@ -7,16 +8,16 @@ import { readFile } from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
 
 import {
+  buildTelegramReplyContextBlock,
   collectTelegramMessageIds,
-  type DownloadedTelegramMessageFile,
-  type DownloadTelegramMessageFilesDeps,
   downloadTelegramMessageFiles,
+  extractTelegramForwardContextText,
   extractTelegramMessagesPromptText,
   extractTelegramMessagesText,
-  appendTelegramReplyContext,
-  extractTelegramReplyContextText,
   formatTelegramHistoryText,
   guessMediaType,
+  type DownloadedTelegramMessageFile,
+  type DownloadTelegramMessageFilesDeps,
   type TelegramMediaMessage,
 } from "./media.ts";
 import type {
@@ -26,32 +27,66 @@ import type {
   TelegramQueueStore,
 } from "./queue.ts";
 
+import {
+  computeVoicePromptContribution,
+  computeVoiceTurnFlags,
+  getTelegramVoiceReplyMode,
+  TELEGRAM_VOICE_REPLY_MODES,
+  type TelegramVoiceReplyMode,
+} from "./voice.ts";
+
+// Re-export for backward compatibility with existing namespace imports (e.g. Turns.getTelegramVoiceReplyMode in routing.ts)
+export {
+  getTelegramVoiceReplyMode,
+  TELEGRAM_VOICE_REPLY_MODES,
+  type TelegramVoiceReplyMode,
+};
+
 export const TELEGRAM_PREFIX = "[telegram]";
+
+export interface TelegramTurnTarget {
+  chatId: number;
+  threadId?: number;
+}
 
 export interface TelegramTurnMessage {
   message_id: number;
-  chat: { id: number };
+  message_thread_id?: number;
+  chat: { id: number; type?: string };
 }
 
 export type DownloadedTelegramTurnFile = DownloadedTelegramMessageFile;
 
-export function truncateTelegramQueueSummary(
-  text: string,
-  maxWords = 5,
-  maxLength = 40,
-): string {
-  const normalized = text.replace(/\s+/g, " ").trim();
-  if (!normalized) return "";
-  const words = normalized.split(" ");
-  let summary = words.slice(0, maxWords).join(" ");
-  if (summary.length === 0) summary = normalized;
-  if (summary.length > maxLength) {
-    summary = summary.slice(0, maxLength).trimEnd();
-  }
-  return summary.length < normalized.length || words.length > maxWords
-    ? `${summary}…`
-    : summary;
+function getTelegramTurnTarget(message: TelegramTurnMessage): TelegramTurnTarget {
+  return Number.isInteger(message.message_thread_id)
+    ? { chatId: message.chat.id, threadId: message.message_thread_id }
+    : { chatId: message.chat.id };
 }
+
+function formatTelegramPrefixAttributeValue(value: string): string {
+  return value.replace(/[\]\n\r|]+/g, " ").replace(/\s+/g, " ").trim();
+}
+
+export function createTelegramTurnPrefix(
+  attributes: Record<string, string | undefined> = {},
+): string {
+  const parts = [TELEGRAM_PREFIX.slice(1, -1)];
+  for (const [key, value] of Object.entries(attributes)) {
+    const normalized = value ? formatTelegramPrefixAttributeValue(value) : "";
+    if (normalized) parts.push(`${key}:${normalized}`);
+  }
+  return `[${parts.join("|")}]`;
+}
+
+export function formatTelegramTurnPrefix(
+  _message: TelegramTurnMessage,
+  basePrefix = TELEGRAM_PREFIX,
+): string {
+  return basePrefix;
+}
+
+import { truncateTelegramQueueSummary } from "./queue.ts";
+export { truncateTelegramQueueSummary };
 
 export function formatTelegramTurnStatusSummary(
   rawText: string,
@@ -97,10 +132,33 @@ function appendTelegramAttachmentSection(
   return `${prefix}${header}\n${items.map((item) => `- ${item}`).join("\n")}`;
 }
 
+function appendTelegramSourceContext(text: string, sourceContext: string | undefined): string {
+  if (!sourceContext) return text;
+  return text ? `${text}\n\n${sourceContext}` : sourceContext;
+}
+
 function appendTelegramPromptText(prompt: string, rawText: string): string {
   if (!rawText) return prompt;
+  if (rawText.startsWith("\n")) return `${prompt}${rawText}`;
   return `${prompt} ${rawText}`;
 }
+
+function appendTelegramVoiceContext(
+  prompt: string,
+  entries: Record<string, string>,
+): string {
+  const prefix = prompt.length > 0 ? `${prompt}\n\n` : "";
+  const pairs = Object.entries(entries);
+  if (pairs.length === 1) {
+    const [key, value] = pairs[0];
+    return `${prefix}[voice] ${key}: ${value}`;
+  }
+  return `${prefix}[voice]\n${pairs
+    .map(([key, value]) => `- ${key}: ${value}`)
+    .join("\n")}`;
+}
+
+// --- Voice Policy And Tagging ---
 
 export function buildTelegramTurnPrompt(options: {
   telegramPrefix: string;
@@ -108,7 +166,10 @@ export function buildTelegramTurnPrompt(options: {
   files: DownloadedTelegramTurnFile[];
   promptFiles?: DownloadedTelegramTurnFile[];
   handlerOutputs?: string[];
+  sourceContext?: string;
   historyTurns?: Pick<PendingTelegramTurn, "historyText">[];
+  timeLine?: string | null;
+  voiceContext?: Record<string, string>;
 }): string {
   let prompt = options.telegramPrefix;
   if ((options.historyTurns?.length ?? 0) > 0) {
@@ -127,11 +188,18 @@ export function buildTelegramTurnPrompt(options: {
   }
   const promptFiles = options.promptFiles ?? options.files;
   prompt = appendTelegramAttachmentSection(prompt, promptFiles);
+  prompt = appendTelegramSourceContext(prompt, options.sourceContext);
   prompt = appendTelegramListSection(
     prompt,
     "outputs",
     options.handlerOutputs ?? [],
   );
+  if (options.voiceContext) {
+    prompt = appendTelegramVoiceContext(prompt, options.voiceContext);
+  }
+  if (options.timeLine) {
+    prompt = `${prompt}\n\n[time] ${options.timeLine}`;
+  }
   return prompt;
 }
 
@@ -308,8 +376,13 @@ export interface BuildTelegramPromptTurnOptions {
   files: DownloadedTelegramTurnFile[];
   promptFiles?: DownloadedTelegramTurnFile[];
   handlerOutputs?: string[];
+  sourceContext?: string;
+  timeLine?: string | null;
   readBinaryFile: (path: string) => Promise<Uint8Array>;
   inferImageMimeType: (path: string) => string | undefined;
+  voiceReplyMode?: TelegramVoiceReplyMode;
+  voiceReplyModeConfigured?: boolean;
+  voicePromptContribution?: string;
 }
 
 export type BuildTelegramPromptTurnRuntimeOptions = Omit<
@@ -330,6 +403,12 @@ export interface TelegramPromptTurnRuntimeBuilderDeps<
     promptFiles?: DownloadedTelegramTurnFile[];
     handlerOutputs?: string[];
   }>;
+  resolveTimeLine?: (chatId: number) => string | null;
+  getVoiceReplyMode?: () => TelegramVoiceReplyMode;
+  isVoiceReplyModeConfigured?: () => boolean;
+  /** Returns the visible thread label for a message target, used to add thread context to the prompt prefix. */
+  getTelegramThreadLabel?: (message: { chat: { id: number }; message_thread_id?: number }) => string | undefined;
+  getAllowedUserId?: () => number | undefined;
 }
 
 export function createTelegramPromptTurnRuntimeBuilder<
@@ -344,8 +423,18 @@ export function createTelegramPromptTurnRuntimeBuilder<
 ) => Promise<PendingTelegramTurn> {
   return async (messages, historyTurns = [], ctx) => {
     const rawText = extractTelegramMessagesText(messages);
-    const replyContext = messages[0]
-      ? extractTelegramReplyContextText(messages[0])
+    const firstMessage = messages[0];
+    const replyFiles = firstMessage?.reply_to_message
+      ? await downloadTelegramMessageFiles(
+          [firstMessage.reply_to_message as typeof firstMessage],
+          { downloadFile: deps.downloadFile },
+        )
+      : [];
+    const replyContext = firstMessage
+      ? buildTelegramReplyContextBlock(firstMessage, replyFiles)
+      : "";
+    const forwardContext = firstMessage
+      ? extractTelegramForwardContextText(firstMessage, deps.getAllowedUserId?.())
       : "";
     const files = await downloadTelegramMessageFiles(messages, {
       downloadFile: deps.downloadFile,
@@ -353,23 +442,60 @@ export function createTelegramPromptTurnRuntimeBuilder<
     const processed = deps.processAttachments
       ? await deps.processAttachments(files, rawText, ctx as TContext)
       : { rawText, promptFiles: files };
-    const promptText = appendTelegramReplyContext(
-      processed.rawText,
-      replyContext,
-    );
+    const sourceBlocks: string[] = [];
+    let promptRawText = processed.rawText;
+    if (forwardContext) {
+      sourceBlocks.push(
+        `[forward|${forwardContext.replace(/:\s+/g, ":")}]${
+          processed.rawText ? ` ${processed.rawText}` : ""
+        }`,
+      );
+      promptRawText = "";
+    }
+    if (replyContext) sourceBlocks.push(replyContext);
+    const sourceContext = sourceBlocks.join("\n\n");
+    // Compute voice mode once and pass it to both the turn builder and the prompt contribution helper
+    const voiceReplyMode = deps.getVoiceReplyMode?.();
+    const chatId = messages[0]?.chat.id;
+    const timeLine =
+      deps.resolveTimeLine && chatId !== undefined
+        ? deps.resolveTimeLine(chatId)
+        : null;
+    const threadLabel = firstMessage
+      ? deps.getTelegramThreadLabel?.(firstMessage)
+      : undefined;
+    const telegramPrefix = createTelegramTurnPrefix({ thread: threadLabel });
     return buildTelegramPromptTurnRuntime({
-      telegramPrefix: TELEGRAM_PREFIX,
+      telegramPrefix,
       messages,
       historyTurns,
       queueOrder: deps.allocateQueueOrder(),
-      rawText: promptText,
+      rawText: promptRawText,
+      sourceContext,
       statusText: processed.rawText,
       files,
       promptFiles: processed.promptFiles,
       handlerOutputs: processed.handlerOutputs,
+      timeLine,
       inferImageMimeType: guessMediaType,
+      voiceReplyMode,
+      voiceReplyModeConfigured: deps.isVoiceReplyModeConfigured?.(),
+      voicePromptContribution: computeVoicePromptContribution(
+        voiceReplyMode,
+        files,
+        rawText,
+      ),
     });
   };
+}
+
+function getTelegramVoicePromptContext(
+  voiceReplyMode: TelegramVoiceReplyMode,
+  hasVoiceFile: boolean,
+): Record<string, string> | undefined {
+  if (voiceReplyMode === "always") return { "reply mode": "always" };
+  if (!hasVoiceFile) return undefined;
+  return { "reply mode": voiceReplyMode };
 }
 
 export async function buildTelegramPromptTurn(
@@ -379,16 +505,30 @@ export async function buildTelegramPromptTurn(
   if (!firstMessage) {
     throw new Error("Missing Telegram message for turn creation");
   }
+  const hasVoiceFile = options.files.some(
+    (f) => f.kind === "voice" || f.kind === "audio",
+  );
+  const voiceReplyMode = options.voiceReplyMode ?? getTelegramVoiceReplyMode();
+  const showVoiceContext =
+    options.voiceReplyModeConfigured ?? options.voiceReplyMode !== undefined;
   const content: TelegramPromptContent[] = [
     {
       type: "text",
       text: buildTelegramTurnPrompt({
-        telegramPrefix: options.telegramPrefix,
+        telegramPrefix: formatTelegramTurnPrefix(
+          firstMessage,
+          options.telegramPrefix,
+        ),
         rawText: options.rawText,
         files: options.files,
         promptFiles: options.promptFiles,
         handlerOutputs: options.handlerOutputs,
+        sourceContext: options.sourceContext,
         historyTurns: options.historyTurns,
+        timeLine: options.timeLine,
+        voiceContext: showVoiceContext
+          ? getTelegramVoicePromptContext(voiceReplyMode, hasVoiceFile)
+          : undefined,
       }),
     },
   ];
@@ -403,9 +543,19 @@ export async function buildTelegramPromptTurn(
       mimeType: mediaType,
     });
   }
+  if (options.voicePromptContribution?.trim()) {
+    const textItem = content.find((c) => c.type === "text") as
+      | { type: "text"; text: string }
+      | undefined;
+    if (textItem) {
+      textItem.text = `${textItem.text}\n\n${options.voicePromptContribution.trim()}`;
+    }
+  }
+
   return {
     kind: "prompt",
     chatId: firstMessage.chat.id,
+    target: getTelegramTurnTarget(firstMessage),
     replyToMessageId: firstMessage.message_id,
     sourceMessageIds: collectTelegramMessageIds(options.messages),
     queueOrder: options.queueOrder,
@@ -413,16 +563,21 @@ export async function buildTelegramPromptTurn(
     laneOrder: options.queueOrder,
     queuedAttachments: [],
     content,
-    historyText: formatTelegramHistoryText(
-      options.rawText,
-      options.promptFiles ?? options.files,
-      options.handlerOutputs,
+    historyText: appendTelegramSourceContext(
+      formatTelegramHistoryText(
+        options.rawText,
+        options.promptFiles ?? options.files,
+        options.handlerOutputs,
+      ),
+      options.sourceContext,
     ),
     statusSummary: formatTelegramTurnStatusSummary(
       options.statusText ?? options.rawText,
       options.promptFiles ?? options.files,
       options.handlerOutputs,
     ),
+    // Voice tagging (used for preview suppression and prompt guidance)
+    ...computeVoiceTurnFlags(voiceReplyMode, hasVoiceFile),
   };
 }
 

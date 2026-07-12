@@ -1,6 +1,6 @@
 /**
  * Regression tests for project architecture invariants
- * Guards import graph shape, shared-bucket bans, and external SDK boundary rules
+ * Guards import graph shape, shared-bucket bans, and polling SDK boundary rules
  */
 
 import assert from "node:assert/strict";
@@ -13,6 +13,9 @@ const PROJECT_ROOT = process.cwd();
 function getProjectTypeScriptFiles(): string[] {
   return [
     "index.ts",
+    ...readdirSync(join(PROJECT_ROOT, "api"))
+      .filter((name) => name.endsWith(".ts"))
+      .map((name) => join("api", name)),
     ...readdirSync(join(PROJECT_ROOT, "lib"))
       .filter((name) => name.endsWith(".ts"))
       .map((name) => join("lib", name)),
@@ -25,6 +28,9 @@ function getProjectTypeScriptFiles(): string[] {
 function getProjectSourceFiles(): string[] {
   return [
     "index.ts",
+    ...readdirSync(join(PROJECT_ROOT, "api"))
+      .filter((name) => name.endsWith(".ts"))
+      .map((name) => join("api", name)),
     ...readdirSync(join(PROJECT_ROOT, "lib"))
       .filter((name) => name.endsWith(".ts"))
       .map((name) => join("lib", name)),
@@ -133,13 +139,37 @@ test("Source-only invariant scans ignore strings and comments", () => {
   );
 });
 
+test("Domain test filenames mirror their owning lib domain", () => {
+  const libDomains = new Set(
+    readdirSync(join(PROJECT_ROOT, "lib"))
+      .filter((name) => name.endsWith(".ts"))
+      .map((name) => name.replace(/\.ts$/, "")),
+  );
+  const nonLibTestDomains = new Set([
+    "index",
+    "integration",
+    "invariants",
+    "process-shutdown",
+    "public-api",
+  ]);
+  const unmirrored = readdirSync(join(PROJECT_ROOT, "tests"))
+    .filter((name) => name.endsWith(".test.ts"))
+    .map((name) => name.replace(/\.test\.ts$/, ""))
+    .filter(
+      (domain) => !libDomains.has(domain) && !nonLibTestDomains.has(domain),
+    );
+
+  assert.deepEqual(unmirrored, []);
+});
+
 test("Project source imports stay acyclic", () => {
   const graph = buildProjectImportGraph(getProjectSourceFiles());
   const cycles = findImportCycles(graph);
+
   assert.deepEqual(
     cycles,
     [],
-    cycles.map((cycle) => cycle.join(" -> ")).join("\n"),
+    "Import cycles found:\n" + cycles.map((c) => c.join(" -> ")).join("\n"),
   );
 });
 
@@ -148,11 +178,45 @@ test("Project no longer has shared constants or transport-type domains", () => {
   assert.equal(existsSync(join(PROJECT_ROOT, "lib", "types.ts")), false);
 });
 
+test("Preview domain stays independent from UI/compat rendering", () => {
+  assert.equal(
+    getImportSpecifiers(join("lib", "preview.ts")).includes("./rendering.ts"),
+    false,
+  );
+});
+
+test("Package exports expose only stable public domains", () => {
+  const packageJson = JSON.parse(
+    readFileSync(join(PROJECT_ROOT, "package.json"), "utf8"),
+  ) as { exports?: Record<string, string> };
+
+  assert.deepEqual(packageJson.exports, {
+    ".": "./index.ts",
+    "./inbound": "./api/inbound.ts",
+    "./outbound": "./api/outbound.ts",
+    "./updates": "./api/updates.ts",
+    "./commands": "./api/commands.ts",
+    "./sections": "./api/sections.ts",
+    "./status": "./api/status.ts",
+    "./voice": "./api/voice.ts",
+    "./keyboard": "./api/keyboard.ts",
+  });
+});
+
 test("Project TypeScript files start with responsibility headers", () => {
   const filesWithoutHeaders = getProjectTypeScriptFiles().filter((file) => {
     return !readFileSync(join(PROJECT_ROOT, file), "utf8").startsWith("/**");
   });
   assert.deepEqual(filesWithoutHeaders, []);
+});
+
+test("Project source module headers include Domain DAG zone tags", () => {
+  const sourceFilesWithoutZoneTags = getProjectSourceFiles().filter((file) => {
+    const source = readFileSync(join(PROJECT_ROOT, file), "utf8");
+    const header = source.match(/^\/\*\*[\s\S]*?\*\//)?.[0] ?? "";
+    return !/^ \* Zones: .+/m.test(header);
+  });
+  assert.deepEqual(sourceFilesWithoutZoneTags, []);
 });
 
 test("Project source avoids empty interface-extension shells", () => {
@@ -173,7 +237,13 @@ test("Pi SDK imports stay centralized in the pi adapter", () => {
   const directSdkImportFiles = getProjectSourceFiles().filter((file) => {
     if (file === normalize(join("lib", "pi.ts"))) return false;
     const source = readFileSync(join(PROJECT_ROOT, file), "utf8");
-    return source.includes("@mariozechner/pi-coding-agent");
+    const piSdkPackages = [
+      "@mariozechner/pi-coding-agent",
+      "@earendil-works/pi-coding-agent",
+      "@earendil-works/pi-agent-core",
+      "@earendil-works/pi-ai",
+    ];
+    return piSdkPackages.some((packageName) => source.includes(packageName));
   });
   assert.deepEqual(directSdkImportFiles, []);
 });
@@ -198,6 +268,40 @@ test("Entrypoint stays a composition root without local runtime adapters", () =>
   assert.equal(/\bpi\./.test(source), false);
 });
 
+test("Visible thread identity never falls back directly to bare slot labels", () => {
+  const forbiddenPatterns: Array<[RegExp, string]> = [
+    [/\bthreadName\s*\?\?\s*slot\b/g, "threadName ?? slot"],
+    [
+      /\brecord\.threadName\s*\?\?\s*record\.slot\b/g,
+      "record.threadName ?? record.slot",
+    ],
+    [/\?\s*[\w.]+\.threadName\s*:\s*[\w.]+\.slot\b/g, "ternary slot fallback"],
+  ];
+  const violations = getProjectSourceFiles().flatMap((file) => {
+    const source = stripSourceTextAndComments(
+      readFileSync(join(PROJECT_ROOT, file), "utf8"),
+    );
+    return forbiddenPatterns.flatMap(([pattern, label]) =>
+      [...source.matchAll(pattern)].map(
+        (match) => `${file}: ${label}: ${match[0].replace(/\s+/g, " ")}`,
+      ),
+    );
+  });
+
+  assert.deepEqual(violations, []);
+});
+
+test("Destructive forum-topic lifecycle cleanup stays in the thread reconciler", () => {
+  const directCleanupFiles = getProjectSourceFiles().filter((file) => {
+    if (file === join("lib", "thread-reconciler.ts")) return false;
+    const source = stripSourceTextAndComments(
+      readFileSync(join(PROJECT_ROOT, file), "utf8"),
+    );
+    return /\b(?:closeForumTopic|deleteForumTopic)\b/.test(source);
+  });
+  assert.deepEqual(directCleanupFiles, []);
+});
+
 test("Runtime state domain stays free of local domain imports", () => {
   const localImportSpecifiers = getImportSpecifiers(
     join("lib", "runtime.ts"),
@@ -215,6 +319,7 @@ test("Structural leaf domains stay free of local nominal imports", () => {
       ),
     ]),
   );
+
   assert.deepEqual(localImportsByFile, {
     [join("lib", "polling.ts")]: [],
     [join("lib", "setup.ts")]: [],
@@ -234,8 +339,8 @@ test("Menu domain stays on structural ports and does not re-export model", () =>
   );
 });
 
-test("API transport stays decoupled from persisted config defaults", () => {
-  const apiImports = getImportSpecifiers(join("lib", "api.ts"));
+test("Telegram API transport stays decoupled from persisted config defaults", () => {
+  const apiImports = getImportSpecifiers(join("lib", "telegram-api.ts"));
   assert.equal(apiImports.includes("./config.ts"), false);
 });
 
@@ -244,7 +349,7 @@ test("Structural update and media domains stay decoupled from concrete API trans
   const apiImportsByFile = Object.fromEntries(
     structuralFiles.map((file) => [
       join("lib", file),
-      getImportSpecifiers(join("lib", file)).includes("./api.ts"),
+      getImportSpecifiers(join("lib", file)).includes("./telegram-api.ts"),
     ]),
   );
   assert.deepEqual(apiImportsByFile, {
@@ -253,9 +358,11 @@ test("Structural update and media domains stay decoupled from concrete API trans
   });
 });
 
-test("Attachment delivery stays decoupled from queue, inbound media, and API helpers", () => {
-  const attachmentImports = getImportSpecifiers(join("lib", "attachments.ts"));
+test("Outbound attachment delivery stays decoupled from queue, inbound media, and API helpers", () => {
+  const attachmentImports = getImportSpecifiers(
+    join("lib", "outbound-attachments.ts"),
+  );
   assert.equal(attachmentImports.includes("./queue.ts"), false);
   assert.equal(attachmentImports.includes("./media.ts"), false);
-  assert.equal(attachmentImports.includes("./api.ts"), false);
+  assert.equal(attachmentImports.includes("./telegram-api.ts"), false);
 });

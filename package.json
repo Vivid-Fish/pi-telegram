@@ -1,9 +1,11 @@
 {
   "name": "@llblab/pi-telegram",
-  "version": "0.6.3-vividfish.2",
+  "version": "0.20.6",
   "private": false,
-  "description": "Better Telegram DM bridge extension for pi",
-  "type": "module",
+  "publishConfig": {
+    "access": "public"
+  },
+  "description": "Telegram runtime adapter for Pi",
   "keywords": [
     "pi-package",
     "pi",
@@ -11,6 +13,7 @@
     "bot",
     "extension"
   ],
+  "type": "module",
   "license": "MIT",
   "repository": {
     "type": "git",
@@ -19,6 +22,9 @@
   "homepage": "https://github.com/llblab/pi-telegram",
   "bugs": {
     "url": "https://github.com/llblab/pi-telegram/issues"
+  },
+  "engines": {
+    "node": ">=22.19.0"
   },
   "scripts": {
     "test": "node --experimental-strip-types --test tests/*.test.ts",
@@ -29,13 +35,25 @@
   },
   "files": [
     "index.ts",
+    "api/",
     "lib/",
     "README.md",
+    "AGENTS.md",
+    "BACKLOG.md",
+    "CHANGELOG.md",
     "docs/",
     "screenshot.png"
   ],
-  "publishConfig": {
-    "access": "public"
+  "exports": {
+    ".": "./index.ts",
+    "./inbound": "./api/inbound.ts",
+    "./outbound": "./api/outbound.ts",
+    "./updates": "./api/updates.ts",
+    "./commands": "./api/commands.ts",
+    "./sections": "./api/sections.ts",
+    "./status": "./api/status.ts",
+    "./voice": "./api/voice.ts",
+    "./keyboard": "./api/keyboard.ts"
   },
   "pi": {
     "extensions": [
@@ -44,13 +62,35 @@
     "image": "https://github.com/llblab/pi-telegram/raw/main/screenshot.png"
   },
   "peerDependencies": {
-    "@mariozechner/pi-agent-core": "*",
-    "@mariozechner/pi-ai": "*",
-    "@mariozechner/pi-coding-agent": "*",
+    "@earendil-works/pi-agent-core": "*",
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
     "@sinclair/typebox": "*"
   },
   "devDependencies": {
     "@types/node": "latest",
     "typescript": "latest"
+  },
+  "overrides": {
+    "protobufjs": "7.6.4",
+    "undici": "8.5.0",
+    "ws": "8.21.0",
+    "@earendil-works/pi-coding-agent": {
+      "protobufjs": "7.6.4",
+      "undici": "8.5.0",
+      "ws": "8.21.0",
+      "@google/genai": {
+        "protobufjs": "7.6.4",
+        "ws": "8.21.0"
+      },
+      "@earendil-works/pi-ai": {
+        "protobufjs": "7.6.4",
+        "ws": "8.21.0",
+        "@google/genai": {
+          "protobufjs": "7.6.4",
+          "ws": "8.21.0"
+        }
+      }
+    }
   }
 }

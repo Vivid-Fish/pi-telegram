@@ -1,5 +1,9 @@
 # Extension Locks Standard
 
+**Meta-contract:** transportable (bit-for-bit identical across projects), high-density (zero fluff), constant (evolve by crystallizing, not speculating), optimal minimum (add only when it hurts).
+
+---
+
 `locks.json` is a shared registry for singleton pi extensions.
 
 Path:
@@ -12,7 +16,7 @@ Path:
 
 ```json
 {
-  "@llblab/pi-telegram": {
+  "@scope/pi-singleton": {
     "pid": 2590864,
     "cwd": "/home/user/project"
   }
@@ -34,9 +38,9 @@ For npm-style package extensions, the canonical value is the `package.json` `nam
 Examples:
 
 ```text
-extensions/pi-telegram/package.json name=@llblab/pi-telegram -> @llblab/pi-telegram
-extensions/pi-telegram/index.ts without package.json         -> pi-telegram
-extensions/pi-telegram.ts                                    -> pi-telegram
+extensions/pi-singleton/package.json name=@scope/pi-singleton -> @scope/pi-singleton
+extensions/pi-singleton/index.ts without package.json         -> pi-singleton
+extensions/pi-singleton.ts                                    -> pi-singleton
 ```
 
 ## Required fields
@@ -54,13 +58,13 @@ During a user-initiated start/connect event, an extension should:
 1. Read its lock entry
 2. If `pid` is stale, replace the entry
 3. If `pid` and `cwd` match the current pi instance, refresh or keep the entry
-4. If a live external owner exists, ask interactively whether to move singleton ownership here
+4. If a live polling owner exists, ask interactively whether to move singleton ownership here
 
 ## Acquisition timing
 
-Lock writes must be caused by an explicit user-initiated runtime event, such as `/wakeup-start`, `/telegram-connect`, or a confirmed takeover prompt.
+Lock writes must be caused by an explicit user-initiated runtime event, such as a start/connect command or a confirmed takeover prompt.
 
-Extension initialization and session-start hooks may read `locks.json`, update local status, install ownership watchers, and resume local work when the existing lock already points at the current `pid`/`cwd`. After a full process restart, a session-start hook may replace a stale lock from the same `cwd` to restore explicitly requested ownership. They must not create ownership from an inactive lock, take over a live external owner, or replace a stale lock from another directory by themselves. Such locks should stay visible as state until the user runs the start/connect command. Session replacement should suspend local runtime work and ownership watchers without releasing the lock, so the next session in the same `pid`/`cwd` can resume from explicit ownership.
+Extension initialization and session-start hooks may read `locks.json`, update local status, install ownership watchers, and resume local work when the existing lock already points at the current `pid`/`cwd`. After a full process restart, a session-start hook may replace a stale lock from the same `cwd` to restore explicitly requested ownership. They must not create ownership from an inactive lock, take over a live polling owner, or replace a stale lock from another directory by themselves. Such locks should stay visible as state until the user runs the start/connect command. Session replacement should suspend local runtime work and ownership watchers without releasing the lock, so the next session in the same `pid`/`cwd` can resume from explicit ownership.
 
 ## Optional fields
 
@@ -88,25 +92,27 @@ Do not print optional fields in normal UI unless they help the user act.
 
 ## Runtime status
 
-Singleton extensions with footer/status presence should expose quiet but explicit local state. For example, pi-wakeup uses:
+Singleton extensions with footer/status presence should expose quiet but explicit local state:
 
-- `wakeup off` when this pi instance does not own the singleton runtime
-- `wakeup on` when this pi instance owns the runtime but has no pending wake-up detail to show
-- `wakeup [16:32:39]` when the runtime owns scheduled work and can show the next countdown
+- `off` when this pi instance does not own the singleton runtime
+- `on` when this pi instance owns the runtime but has no pending runtime detail to show
+- `[16:32:39]` when the runtime owns scheduled work and can show the next countdown
+
+Extensions may prefix those states with their own compact name, such as `wakeup off` or `telegram on`.
 
 ## Interactive takeover
 
 Start/connect commands should make singleton moves easy:
 
 1. If no live owner exists, take ownership without an extra prompt
-2. If a live external owner exists, ask whether to move singleton ownership to this pi instance
+2. If a live polling owner exists, ask whether to move singleton ownership to this pi instance
 3. On confirmation, write the current `{ "pid": ..., "cwd": ... }` to this extension's key in `locks.json`
-4. The previous owner must notice that `locks.json` no longer points at its own `pid`/`cwd` and stop local runtime work without deleting the new lock
+4. The previous owner must notice that `locks.json` no longer points at its own `pid`/`cwd` and stop singleton-owned work such as polling/watchers without deleting the new lock or unrelated session-local queues
 
 Takeover prompts should use the extension name as the dialog title, then the question, a blank line, and source/target lines:
 
 ```text
-pi-telegram
+pi-singleton
 move singleton lock here?
 
 from: pid 2590864, cwd /old
@@ -115,11 +121,11 @@ to: /new
 
 Avoid repeating the extension name in the body. Color is encouraged: extension title/name accent, question warning, `from:`/`to:` muted.
 
-The previous owner may use `fs.watch`, mtime polling, or an existing status/timer tick. Long-lived watchers should compare against a snapshotted `pid`/`cwd` identity rather than a live pi context object, because session replacement such as `/new` makes captured contexts stale. The important contract is graceful local shutdown after ownership mismatch.
+The previous owner may use `fs.watch`, mtime polling, or an existing status/timer tick. Long-lived watchers should compare against a snapshotted `pid`/`cwd` identity rather than a live pi context object, because session replacement such as `/new` makes captured contexts stale. The important contract is graceful singleton-runtime shutdown after ownership mismatch while session-local state that does not require polling remains owned by its original instance.
 
 ## Reset
 
-Delete `~/.pi/agent/locks.json` to reset singleton runtime ownership for all participating extensions without deleting their configuration files such as `telegram.json`.
+Delete `~/.pi/agent/locks.json` to reset singleton runtime ownership for all participating extensions without deleting their configuration files.
 
 ## Atomicity
 

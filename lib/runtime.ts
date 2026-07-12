@@ -1,9 +1,11 @@
 /**
  * Telegram bridge runtime-state helpers
+ * Zones: pi agent runtime state, telegram session, shared coordination
  * Owns small session-local runtime primitives that are shared by orchestration but are not specific to queueing, rendering, polling, or Telegram transport
  */
 
-const TELEGRAM_TYPING_ACTION_INTERVAL_MS = 4000;
+const TELEGRAM_TYPING_ACTION_INTERVAL_MS = 2500;
+const TELEGRAM_TYPING_IDLE_DRAIN_MAX_MS = 250;
 
 export interface TelegramRuntimeQueueCounters {
   nextQueuedTelegramItemOrder: number;
@@ -15,7 +17,7 @@ export interface TelegramRuntimeLifecycleFlags {
   activeTelegramToolExecutions: number;
   telegramTurnDispatchPending: boolean;
   compactionInProgress: boolean;
-  preserveQueuedTurnsAsHistory: boolean;
+  foldQueuedPromptsIntoHistory: boolean;
   setupInProgress: boolean;
 }
 
@@ -23,6 +25,9 @@ export interface TelegramBridgeRuntimeState
   extends TelegramRuntimeQueueCounters, TelegramRuntimeLifecycleFlags {
   abortHandler?: () => void;
   typingInterval?: ReturnType<typeof setInterval>;
+  typingInFlight?: Promise<void>;
+  typingLoopDeps?: TelegramTypingLoopDeps;
+  typingLoopKey?: string;
 }
 
 export interface TelegramRuntimeQueuePort {
@@ -43,8 +48,8 @@ export interface TelegramRuntimeLifecyclePort {
   clearDispatchPending: () => void;
   isCompactionInProgress: () => boolean;
   setCompactionInProgress: (inProgress: boolean) => void;
-  shouldPreserveQueuedTurnsAsHistory: () => boolean;
-  setPreserveQueuedTurnsAsHistory: (preserve: boolean) => void;
+  shouldFoldQueuedPromptsIntoHistory: () => boolean;
+  setFoldQueuedPromptsIntoHistory: (fold: boolean) => void;
 }
 
 export interface TelegramRuntimeSetupPort {
@@ -64,6 +69,7 @@ export interface TelegramRuntimeAbortPort {
 export interface TelegramRuntimeTypingPort {
   start: (deps: TelegramTypingLoopDeps) => boolean;
   stop: () => boolean;
+  waitForIdle: () => Promise<void>;
 }
 
 export interface TelegramBridgeRuntime {
@@ -83,7 +89,7 @@ export function createTelegramBridgeRuntimeState(): TelegramBridgeRuntimeState {
     activeTelegramToolExecutions: 0,
     telegramTurnDispatchPending: false,
     compactionInProgress: false,
-    preserveQueuedTurnsAsHistory: false,
+    foldQueuedPromptsIntoHistory: false,
     setupInProgress: false,
   };
 }
@@ -116,10 +122,10 @@ export function createTelegramBridgeRuntime(
       isCompactionInProgress: () => isTelegramCompactionInProgress(state),
       setCompactionInProgress: (inProgress) =>
         setTelegramCompactionInProgress(state, inProgress),
-      shouldPreserveQueuedTurnsAsHistory: () =>
-        shouldPreserveQueuedTurnsAsHistory(state),
-      setPreserveQueuedTurnsAsHistory: (preserve) =>
-        setPreserveQueuedTurnsAsHistory(state, preserve),
+      shouldFoldQueuedPromptsIntoHistory: () =>
+        shouldFoldQueuedPromptsIntoHistory(state),
+      setFoldQueuedPromptsIntoHistory: (fold) =>
+        setFoldQueuedPromptsIntoHistory(state, fold),
     },
     setup: {
       isInProgress: () => isTelegramSetupInProgress(state),
@@ -137,6 +143,7 @@ export function createTelegramBridgeRuntime(
     typing: {
       start: (deps) => startTelegramTypingLoop(state, deps),
       stop: () => stopTelegramTypingLoop(state),
+      waitForIdle: () => waitForTelegramTypingLoopIdle(state),
     },
   };
 }
@@ -194,8 +201,8 @@ export function syncTelegramLifecycleRuntimeFlags(
   if (flags.compactionInProgress !== undefined) {
     state.compactionInProgress = flags.compactionInProgress;
   }
-  if (flags.preserveQueuedTurnsAsHistory !== undefined) {
-    state.preserveQueuedTurnsAsHistory = flags.preserveQueuedTurnsAsHistory;
+  if (flags.foldQueuedPromptsIntoHistory !== undefined) {
+    state.foldQueuedPromptsIntoHistory = flags.foldQueuedPromptsIntoHistory;
   }
   if (flags.setupInProgress !== undefined) {
     state.setupInProgress = flags.setupInProgress;
@@ -253,17 +260,17 @@ export function setTelegramCompactionInProgress(
   state.compactionInProgress = inProgress;
 }
 
-export function shouldPreserveQueuedTurnsAsHistory(
+export function shouldFoldQueuedPromptsIntoHistory(
   state: TelegramBridgeRuntimeState,
 ): boolean {
-  return state.preserveQueuedTurnsAsHistory;
+  return state.foldQueuedPromptsIntoHistory;
 }
 
-export function setPreserveQueuedTurnsAsHistory(
+export function setFoldQueuedPromptsIntoHistory(
   state: TelegramBridgeRuntimeState,
-  preserve: boolean,
+  fold: boolean,
 ): void {
-  state.preserveQueuedTurnsAsHistory = preserve;
+  state.foldQueuedPromptsIntoHistory = fold;
 }
 
 export function isTelegramSetupInProgress(
@@ -313,10 +320,29 @@ export function abortTelegramTurn(state: TelegramBridgeRuntimeState): boolean {
   return true;
 }
 
+export interface TelegramTypingLoopTarget {
+  chatId: number;
+  threadId?: number;
+}
+
+function getTelegramTypingLoopThreadParams(
+  target: TelegramTypingLoopTarget | undefined,
+): { message_thread_id?: number } | undefined {
+  const threadId = target?.threadId;
+  return Number.isInteger(threadId)
+    ? { message_thread_id: threadId }
+    : undefined;
+}
+
 export interface TelegramTypingLoopDeps {
   chatId: number | undefined;
+  target?: TelegramTypingLoopTarget;
   intervalMs: number;
-  sendTypingAction: (chatId: number) => Promise<unknown>;
+  sendTypingAction: (
+    chatId: number,
+    options?: { message_thread_id?: number },
+  ) => Promise<unknown>;
+  sendAggregateTypingAction?: (chatId: number) => Promise<unknown>;
 }
 
 export interface TelegramRuntimeEventRecorderPort {
@@ -327,48 +353,134 @@ export interface TelegramRuntimeEventRecorderPort {
   ) => void;
 }
 
+function updateTelegramRuntimeStatusSafely<TContext>(
+  updateStatus: (ctx: TContext, error?: string) => void,
+  ctx: TContext,
+  options: {
+    error?: string;
+    category: string;
+    phase: string;
+    recordRuntimeEvent?: TelegramRuntimeEventRecorderPort["recordRuntimeEvent"];
+  },
+): void {
+  try {
+    updateStatus(ctx, options.error);
+  } catch (statusError) {
+    options.recordRuntimeEvent?.(options.category, statusError, {
+      phase: options.phase,
+    });
+  }
+}
+
 export interface TelegramTypingLoopStarterDeps<
   TContext,
 > extends TelegramRuntimeEventRecorderPort {
   typing: TelegramRuntimeTypingPort;
   getDefaultChatId: () => number | undefined;
-  sendTypingAction: (chatId: number) => Promise<unknown>;
+  sendTypingAction: (
+    chatId: number,
+    options?: { message_thread_id?: number },
+  ) => Promise<unknown>;
+  sendAggregateTypingAction?: (chatId: number) => Promise<unknown>;
   updateStatus: (ctx: TContext, error?: string) => void;
   intervalMs?: number;
 }
 
 export function createTelegramTypingLoopStarter<TContext>(
   deps: TelegramTypingLoopStarterDeps<TContext>,
-): (ctx: TContext, chatId?: number) => void {
-  return (ctx, chatId) => {
+): (
+  ctx: TContext,
+  chatId?: number,
+  options?: { target?: TelegramTypingLoopTarget },
+) => void {
+  return (ctx, chatId, options) => {
     deps.typing.start({
       chatId: chatId ?? deps.getDefaultChatId(),
+      target: options?.target,
       intervalMs: deps.intervalMs ?? TELEGRAM_TYPING_ACTION_INTERVAL_MS,
-      sendTypingAction: async (targetChatId) => {
+      sendTypingAction: async (targetChatId, actionOptions) => {
         try {
-          await deps.sendTypingAction(targetChatId);
+          await deps.sendTypingAction(targetChatId, actionOptions);
         } catch (error) {
           const message =
             error instanceof Error ? error.message : String(error);
+          updateTelegramRuntimeStatusSafely(deps.updateStatus, ctx, {
+            error: message,
+            category: "typing",
+            phase: "status-update",
+            recordRuntimeEvent: deps.recordRuntimeEvent,
+          });
           deps.recordRuntimeEvent?.("typing", error, {
             chatId: targetChatId,
           });
         }
       },
+      sendAggregateTypingAction: deps.sendAggregateTypingAction
+        ? async (targetChatId) => {
+            try {
+              await deps.sendAggregateTypingAction?.(targetChatId);
+            } catch (error) {
+              const message =
+                error instanceof Error ? error.message : String(error);
+              updateTelegramRuntimeStatusSafely(deps.updateStatus, ctx, {
+                error: message,
+                category: "typing",
+                phase: "status-update",
+                recordRuntimeEvent: deps.recordRuntimeEvent,
+              });
+              deps.recordRuntimeEvent?.("typing", error, {
+                chatId: targetChatId,
+                aggregate: true,
+              });
+            }
+          }
+        : undefined,
     });
   };
+}
+
+function getTelegramTypingLoopKey(deps: TelegramTypingLoopDeps): string {
+  const threadId = deps.target?.threadId;
+  return `${deps.chatId ?? 0}:${Number.isInteger(threadId) ? threadId : "all"}`;
 }
 
 export function startTelegramTypingLoop(
   state: TelegramBridgeRuntimeState,
   deps: TelegramTypingLoopDeps,
 ): boolean {
-  if (state.typingInterval || deps.chatId === undefined) return false;
+  if (deps.chatId === undefined || deps.chatId === 0) return false;
+  const previousKey = state.typingLoopKey;
+  const nextKey = getTelegramTypingLoopKey(deps);
+  state.typingLoopDeps = deps;
+  state.typingLoopKey = nextKey;
   const sendTyping = (): void => {
-    void deps.sendTypingAction(deps.chatId as number);
+    const activeDeps = state.typingLoopDeps;
+    if (!activeDeps || activeDeps.chatId === undefined || activeDeps.chatId === 0)
+      return;
+    const targetChatId = activeDeps.chatId;
+    const threadParams = getTelegramTypingLoopThreadParams(activeDeps.target);
+    const typing = Promise.resolve()
+      .then(async () => {
+        await activeDeps.sendTypingAction(targetChatId, threadParams);
+        if (threadParams?.message_thread_id !== undefined) {
+          await activeDeps.sendAggregateTypingAction?.(targetChatId);
+        }
+      })
+      .then(() => undefined)
+      .catch(() => undefined);
+    state.typingInFlight = typing;
+    void typing.finally(() => {
+      if (state.typingInFlight === typing) state.typingInFlight = undefined;
+    });
   };
+  if (state.typingInterval) {
+    if (previousKey === nextKey) return false;
+    sendTyping();
+    return true;
+  }
   sendTyping();
   state.typingInterval = setInterval(sendTyping, deps.intervalMs);
+  state.typingInterval.unref?.();
   return true;
 }
 
@@ -378,7 +490,28 @@ export function stopTelegramTypingLoop(
   if (!state.typingInterval) return false;
   clearInterval(state.typingInterval);
   state.typingInterval = undefined;
+  state.typingLoopDeps = undefined;
+  state.typingLoopKey = undefined;
   return true;
+}
+
+export async function waitForTelegramTypingLoopIdle(
+  state: TelegramBridgeRuntimeState,
+  timeoutMs = TELEGRAM_TYPING_IDLE_DRAIN_MAX_MS,
+): Promise<void> {
+  const inFlight = state.typingInFlight;
+  if (!inFlight) return;
+  if (timeoutMs <= 0) {
+    await Promise.race([inFlight, Promise.resolve()]);
+    return;
+  }
+  await Promise.race([
+    inFlight,
+    new Promise<void>((resolve) => {
+      const timer = setTimeout(resolve, timeoutMs);
+      timer.unref?.();
+    }),
+  ]);
 }
 
 export function createTelegramContextAbortHandlerSetter<
@@ -421,7 +554,11 @@ export interface TelegramPromptDispatchLifecycleDeps<
     "setDispatchPending" | "clearDispatchPending"
   >;
   typing: Pick<TelegramRuntimeTypingPort, "stop">;
-  startTypingLoop: (ctx: TContext, chatId?: number) => void;
+  startTypingLoop: (
+    ctx: TContext,
+    chatId?: number,
+    options?: { target?: TelegramTypingLoopTarget },
+  ) => void;
   updateStatus: (ctx: TContext, error?: string) => void;
 }
 
@@ -431,13 +568,21 @@ export interface TelegramPromptDispatchRuntimeDeps<
   lifecycle: TelegramPromptDispatchLifecycleDeps<TContext>["lifecycle"];
   typing: TelegramRuntimeTypingPort;
   getDefaultChatId: () => number | undefined;
-  sendTypingAction: (chatId: number) => Promise<unknown>;
+  sendTypingAction: (
+    chatId: number,
+    options?: { message_thread_id?: number },
+  ) => Promise<unknown>;
+  sendAggregateTypingAction?: (chatId: number) => Promise<unknown>;
   updateStatus: (ctx: TContext, error?: string) => void;
   intervalMs?: number;
 }
 
 export interface TelegramPromptDispatchRuntime<TContext> {
-  startTypingLoop: (ctx: TContext, chatId?: number) => void;
+  startTypingLoop: (
+    ctx: TContext,
+    chatId?: number,
+    options?: { target?: TelegramTypingLoopTarget },
+  ) => void;
   onPromptDispatchStart: (ctx: TContext, chatId?: number) => void;
   onPromptDispatchFailure: (ctx: TContext, message: string) => void;
 }
@@ -465,13 +610,22 @@ export function createTelegramPromptDispatchLifecycle<TContext>(
     onPromptDispatchStart: (ctx: TContext, chatId?: number): void => {
       deps.lifecycle.setDispatchPending(true);
       deps.startTypingLoop(ctx, chatId);
-      deps.updateStatus(ctx);
+      updateTelegramRuntimeStatusSafely(deps.updateStatus, ctx, {
+        category: "dispatch",
+        phase: "status-update",
+        recordRuntimeEvent: deps.recordRuntimeEvent,
+      });
     },
     onPromptDispatchFailure: (ctx: TContext, message: string): void => {
       deps.lifecycle.clearDispatchPending();
       deps.typing.stop();
       deps.recordRuntimeEvent?.("dispatch", new Error(message));
-      deps.updateStatus(ctx, `dispatch failed: ${message}`);
+      updateTelegramRuntimeStatusSafely(deps.updateStatus, ctx, {
+        error: `dispatch failed: ${message}`,
+        category: "dispatch",
+        phase: "status-update",
+        recordRuntimeEvent: deps.recordRuntimeEvent,
+      });
     },
   };
 }

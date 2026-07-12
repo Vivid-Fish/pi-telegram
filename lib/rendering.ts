@@ -1,6 +1,7 @@
 /**
- * Telegram preview and markdown rendering helpers
- * Converts assistant output into Telegram-safe plain text and HTML chunks with chunk-boundary handling
+ * Telegram UI/compat rendering helpers
+ * Zones: telegram rendering, shared text utils
+ * Converts bridge-owned UI/status/menu/interactive text into Telegram-safe plain text and HTML chunks with chunk-boundary handling
  */
 
 export const MAX_MESSAGE_LENGTH = 4096;
@@ -462,378 +463,7 @@ function matchMarkdownHeadingLine(line: string): RegExpMatchArray | null {
   return line.match(/^(\s*)#{1,6}\s+(.+)$/);
 }
 
-function endsWithMarkdownHeadingLine(markdown: string): boolean {
-  const lines = markdown.split("\n");
-  for (let index = lines.length - 1; index >= 0; index -= 1) {
-    const line = lines[index] ?? "";
-    if (line.trim().length === 0) continue;
-    return matchMarkdownHeadingLine(line) !== null;
-  }
-  return false;
-}
-
-function splitLeadingMarkdownBlankLines(markdown: string): {
-  blankLines: number;
-  remainingText: string;
-} {
-  const lines = markdown.split("\n");
-  let start = 0;
-  while (start < lines.length && (lines[start] ?? "").trim().length === 0) {
-    start += 1;
-  }
-  return {
-    blankLines: start,
-    remainingText: lines.slice(start).join("\n"),
-  };
-}
-
-export type TelegramPreviewRenderStrategy = "plain" | "rich-stable-blocks";
-
-export interface TelegramPreviewSnapshotState {
-  pendingText: string;
-  lastSentText: string;
-  lastSentParseMode?: "HTML";
-  lastSentStrategy?: TelegramPreviewRenderStrategy;
-}
-
-export interface TelegramPreviewSnapshot extends TelegramRenderedChunk {
-  sourceText: string;
-  strategy: TelegramPreviewRenderStrategy;
-}
-
-export function buildTelegramPreviewFlushText(options: {
-  state: TelegramPreviewSnapshotState;
-  maxMessageLength: number;
-  renderPreviewText: (markdown: string) => string;
-}): string | undefined {
-  const rawText = options.state.pendingText.trim();
-  const previewText = options.renderPreviewText(rawText).trim();
-  if (!previewText || previewText === options.state.lastSentText) {
-    return undefined;
-  }
-  return previewText.length > options.maxMessageLength
-    ? previewText.slice(0, options.maxMessageLength)
-    : previewText;
-}
-
-function buildTelegramPlainPreviewSnapshot(options: {
-  sourceText: string;
-  state: TelegramPreviewSnapshotState;
-  maxMessageLength: number;
-  renderPreviewText: (markdown: string) => string;
-}): TelegramPreviewSnapshot | undefined {
-  const previewText = options.renderPreviewText(options.sourceText).trim();
-  if (!previewText) return undefined;
-  const truncatedPreviewText =
-    previewText.length > options.maxMessageLength
-      ? previewText.slice(0, options.maxMessageLength)
-      : previewText;
-  if (
-    truncatedPreviewText === options.state.lastSentText &&
-    options.state.lastSentStrategy === "plain"
-  ) {
-    return undefined;
-  }
-  return {
-    text: truncatedPreviewText,
-    sourceText: options.sourceText,
-    strategy: "plain",
-  };
-}
-
-interface TelegramStablePreviewSplit {
-  stableMarkdown: string;
-  unstableTail: string;
-}
-
-function buildTelegramStablePreviewSplit(
-  lines: string[],
-  stableEndIndex: number,
-): TelegramStablePreviewSplit {
-  return {
-    stableMarkdown: lines.slice(0, stableEndIndex).join("\n"),
-    unstableTail: lines.slice(stableEndIndex).join("\n"),
-  };
-}
-
-function collectTelegramStablePreviewTextBlockLines(
-  lines: string[],
-  index: number,
-): { nextIndex: number } {
-  let nextIndex = index;
-  while (nextIndex < lines.length) {
-    const current = lines[nextIndex] ?? "";
-    const following = lines[nextIndex + 1] ?? "";
-    if (current.trim().length === 0) break;
-    if (
-      nextIndex !== index &&
-      (isFencedCodeStart(current) ||
-        canStartIndentedCodeBlock(lines, nextIndex) ||
-        /^\s*>/.test(current) ||
-        (current.includes("|") && isMarkdownTableSeparator(following)))
-    ) {
-      break;
-    }
-    nextIndex += 1;
-  }
-  return { nextIndex };
-}
-
-function splitTelegramStablePreviewMarkdown(
-  markdown: string,
-): TelegramStablePreviewSplit {
-  const normalized = normalizeMarkdownDocument(markdown);
-  if (normalized.length === 0) return { stableMarkdown: "", unstableTail: "" };
-  const lines = normalized.split("\n");
-  let index = 0;
-  let stableEndIndex = 0;
-  while (index < lines.length) {
-    while (index < lines.length && (lines[index] ?? "").trim().length === 0) {
-      index += 1;
-    }
-    if (index >= lines.length) break;
-    const blockStart = index;
-    const line = lines[index] ?? "";
-    const nextLine = lines[index + 1] ?? "";
-    const fence = parseMarkdownFence(line);
-    if (fence) {
-      const block = collectFencedMarkdownCodeLines(lines, index, fence);
-      if (!block.closed) {
-        return buildTelegramStablePreviewSplit(lines, stableEndIndex);
-      }
-      index = block.nextIndex;
-      stableEndIndex = index;
-      continue;
-    }
-    if (line.includes("|") && isMarkdownTableSeparator(nextLine)) {
-      const block = collectMarkdownTableBlockLines(lines, index);
-      index = block.nextIndex;
-      if (index >= lines.length) {
-        return buildTelegramStablePreviewSplit(lines, stableEndIndex);
-      }
-      stableEndIndex = index;
-      continue;
-    }
-    if (canStartIndentedCodeBlock(lines, index)) {
-      const block = collectIndentedMarkdownCodeLines(lines, index);
-      index = block.nextIndex;
-      if (index >= lines.length) {
-        return buildTelegramStablePreviewSplit(lines, stableEndIndex);
-      }
-      stableEndIndex = index;
-      continue;
-    }
-    if (/^\s*>/.test(line)) {
-      const block = collectMarkdownQuoteBlockLines(lines, index);
-      index = block.nextIndex;
-      if (index >= lines.length) {
-        return buildTelegramStablePreviewSplit(lines, stableEndIndex);
-      }
-      stableEndIndex = index;
-      continue;
-    }
-    const block = collectTelegramStablePreviewTextBlockLines(lines, blockStart);
-    index = block.nextIndex;
-    if (index >= lines.length) {
-      return buildTelegramStablePreviewSplit(lines, stableEndIndex);
-    }
-    stableEndIndex = index;
-  }
-  return buildTelegramStablePreviewSplit(lines, stableEndIndex);
-}
-
-function renderTelegramStablePreviewChunk(options: {
-  stableMarkdown: string;
-  maxMessageLength: number;
-  renderTelegramMessage: (
-    text: string,
-    options?: { mode?: TelegramRenderMode },
-  ) => TelegramRenderedChunk[];
-}): TelegramRenderedChunk | undefined {
-  const stableChunk = options.renderTelegramMessage(options.stableMarkdown, {
-    mode: "markdown",
-  })[0];
-  if (!stableChunk || stableChunk.text.length === 0) return undefined;
-  if (stableChunk.text.length > options.maxMessageLength) return undefined;
-  return stableChunk;
-}
-
-function appendTelegramUnstablePreviewTail(options: {
-  previewText: string;
-  stableMarkdown: string;
-  unstableTail: string;
-  maxMessageLength: number;
-}): string {
-  if (options.unstableTail.length === 0) return options.previewText;
-  const tail = splitLeadingMarkdownBlankLines(options.unstableTail);
-  const minimumBlankLinesBeforeTail = endsWithMarkdownHeadingLine(
-    options.stableMarkdown,
-  )
-    ? 1
-    : 0;
-  const blankLinesBeforeTail = Math.max(
-    tail.blankLines,
-    minimumBlankLinesBeforeTail,
-  );
-  const separator =
-    tail.remainingText.length > 0 ? "\n".repeat(blankLinesBeforeTail + 1) : "";
-  const tailText = escapeHtml(tail.remainingText);
-  const candidate = `${options.previewText}${separator}${tailText}`;
-  return candidate.length <= options.maxMessageLength
-    ? candidate
-    : options.previewText;
-}
-
-function isTelegramPreviewSnapshotUnchanged(options: {
-  text: string;
-  parseMode?: "HTML";
-  state: TelegramPreviewSnapshotState;
-  strategy: TelegramPreviewRenderStrategy;
-}): boolean {
-  return (
-    options.text === options.state.lastSentText &&
-    options.parseMode === options.state.lastSentParseMode &&
-    options.strategy === options.state.lastSentStrategy
-  );
-}
-
-export function buildTelegramPreviewSnapshot(options: {
-  state: TelegramPreviewSnapshotState;
-  maxMessageLength: number;
-  renderPreviewText: (markdown: string) => string;
-  renderTelegramMessage: (
-    text: string,
-    options?: { mode?: TelegramRenderMode },
-  ) => TelegramRenderedChunk[];
-}): TelegramPreviewSnapshot | undefined {
-  const sourceText = options.state.pendingText.trim();
-  if (!sourceText) return undefined;
-  const split = splitTelegramStablePreviewMarkdown(sourceText);
-  if (split.stableMarkdown.length === 0) {
-    return buildTelegramPlainPreviewSnapshot({
-      sourceText,
-      state: options.state,
-      maxMessageLength: options.maxMessageLength,
-      renderPreviewText: options.renderPreviewText,
-    });
-  }
-  const stableChunk = renderTelegramStablePreviewChunk({
-    stableMarkdown: split.stableMarkdown,
-    maxMessageLength: options.maxMessageLength,
-    renderTelegramMessage: options.renderTelegramMessage,
-  });
-  if (!stableChunk) {
-    return buildTelegramPlainPreviewSnapshot({
-      sourceText,
-      state: options.state,
-      maxMessageLength: options.maxMessageLength,
-      renderPreviewText: options.renderPreviewText,
-    });
-  }
-  const previewText = appendTelegramUnstablePreviewTail({
-    previewText: stableChunk.text,
-    stableMarkdown: split.stableMarkdown,
-    unstableTail: split.unstableTail,
-    maxMessageLength: options.maxMessageLength,
-  });
-  if (
-    isTelegramPreviewSnapshotUnchanged({
-      text: previewText,
-      parseMode: stableChunk.parseMode,
-      state: options.state,
-      strategy: "rich-stable-blocks",
-    })
-  ) {
-    return undefined;
-  }
-  return {
-    text: previewText,
-    parseMode: stableChunk.parseMode,
-    sourceText,
-    strategy: "rich-stable-blocks",
-  };
-}
-
-export function renderMarkdownPreviewText(markdown: string): string {
-  const normalized = normalizeMarkdownDocument(markdown);
-  if (normalized.length === 0) return "";
-  const output: string[] = [];
-  const lines = normalized.split("\n");
-  let activeFence: { marker: "`" | "~"; length: number } | undefined;
-  for (const rawLine of lines) {
-    const line = rawLine ?? "";
-    const fence = parseMarkdownFence(line);
-    if (activeFence) {
-      if (fence && isMatchingMarkdownFence(line, activeFence)) {
-        activeFence = undefined;
-        continue;
-      }
-      if (line.trim().length === 0) {
-        output.push("");
-        continue;
-      }
-      output.push(line);
-      continue;
-    }
-    if (fence) {
-      activeFence = { marker: fence.marker, length: fence.length };
-      continue;
-    }
-    if (line.trim().length === 0) {
-      output.push("");
-      continue;
-    }
-    if (isMarkdownTableSeparator(line)) {
-      continue;
-    }
-    const heading = matchMarkdownHeadingLine(line);
-    if (heading) {
-      output.push(stripInlineMarkdownToPlainText(heading[2] ?? ""));
-      continue;
-    }
-    const task = line.match(/^(\s*)([-*+]|\d+\.)\s+\[([ xX])\]\s+(.+)$/);
-    if (task) {
-      const indent = " ".repeat((task[1] ?? "").length);
-      const listMarker = task[2] ?? "-";
-      const checkboxMarker =
-        (task[3] ?? " ").toLowerCase() === "x" ? "[x]" : "[ ]";
-      const taskPrefix = isMarkdownNumberedListMarker(listMarker)
-        ? `${listMarker} ${checkboxMarker}`
-        : checkboxMarker;
-      output.push(
-        `${indent}${taskPrefix} ${stripInlineMarkdownToPlainText(task[4] ?? "")}`,
-      );
-      continue;
-    }
-    const bullet = line.match(/^(\s*)[-*+]\s+(.+)$/);
-    if (bullet) {
-      output.push(
-        `${" ".repeat((bullet[1] ?? "").length)}- ${stripInlineMarkdownToPlainText(bullet[2] ?? "")}`,
-      );
-      continue;
-    }
-    const numbered = line.match(/^(\s*\d+\.)\s+(.+)$/);
-    if (numbered) {
-      output.push(
-        `${numbered[1]} ${stripInlineMarkdownToPlainText(numbered[2] ?? "")}`,
-      );
-      continue;
-    }
-    const quote = line.match(/^\s*>\s?(.+)$/);
-    if (quote) {
-      output.push(`> ${stripInlineMarkdownToPlainText(quote[1] ?? "")}`);
-      continue;
-    }
-    if (/^\s*([-*_]\s*){3,}\s*$/.test(line)) {
-      output.push("────────");
-      continue;
-    }
-    output.push(stripInlineMarkdownToPlainText(line));
-  }
-  return output.join("\n");
-}
-
-// --- Rich Markdown Rendering ---
+// --- UI Markdown-to-Telegram-HTML Rendering ---
 
 function renderDelimitedInlineStyle(
   text: string,
@@ -842,7 +472,7 @@ function renderDelimitedInlineStyle(
 ): string {
   const escapedDelimiter = delimiter.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   const pattern = new RegExp(
-    `(^|[^\\p{L}\\p{N}\\\\])(${escapedDelimiter})(?=\\S)(.+?)(?<=\\S)\\2(?=[^\\p{L}\\p{N}]|$)`,
+    `(^|[^\\p{L}\\p{N}\\\\])(${escapedDelimiter})(?=\\S)([\\s\\S]+?)(?<=\\S)\\2(?=[^\\p{L}\\p{N}]|$)`,
     "gu",
   );
   return text.replace(
@@ -1003,9 +633,28 @@ function renderMarkdownTextPiece(piece: string): string {
   return renderInlineMarkdown(piece);
 }
 
+function isPlainInlineMarkdownLine(line: string): boolean {
+  if (line.trim().length === 0) return false;
+  return (
+    matchMarkdownHeadingLine(line) === null &&
+    !/^(\s*)([-*+]|\d+\.)\s+\[([ xX])\]\s+(.+)$/.test(line) &&
+    !/^(\s*)[-*+]\s+(.+)$/.test(line) &&
+    !/^(\s*)(\d+)\.\s+(.+)$/.test(line) &&
+    !/^>\s?(.+)$/.test(line) &&
+    !/^([-*_]\s*){3,}$/.test(line.trim())
+  );
+}
+
 function renderMarkdownTextLines(block: string): string[] {
   const rendered: string[] = [];
   const lines = block.split("\n");
+  const nonBlankLines = lines.filter((line) => line.trim().length > 0);
+  if (
+    nonBlankLines.length > 1 &&
+    nonBlankLines.every(isPlainInlineMarkdownLine)
+  ) {
+    return renderInlineMarkdown(nonBlankLines.join("\n")).split("\n");
+  }
   for (const line of lines) {
     if (line.trim().length === 0) continue;
     for (const piece of splitPlainMarkdownLine(line)) {

@@ -7,6 +7,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import telegramExtension from "../index.ts";
+import * as telegramEntrypoint from "../index.ts";
 import type { ExtensionAPI, ExtensionContext } from "../lib/pi.ts";
 
 type RegisteredIndexTool = {
@@ -23,7 +24,7 @@ type RegisteredIndexHandler = (
 ) => Promise<unknown> | unknown;
 
 function createIndexApiHarness() {
-  let tool: RegisteredIndexTool | undefined;
+  const tools = new Map<string, RegisteredIndexTool>();
   const commands = new Map<string, RegisteredIndexCommand>();
   const handlers = new Map<string, RegisteredIndexHandler>();
   const api = {
@@ -31,13 +32,13 @@ function createIndexApiHarness() {
       handlers.set(event, handler);
     },
     registerTool: (definition: RegisteredIndexTool) => {
-      tool = definition;
+      if (definition.name) tools.set(definition.name, definition);
     },
     registerCommand: (name: string, definition: RegisteredIndexCommand) => {
       commands.set(name, definition);
     },
   } as unknown as ExtensionAPI;
-  return { tool: () => tool, commands, handlers, api };
+  return { tools, commands, handlers, api };
 }
 
 function getRequiredIndexHandler(
@@ -60,10 +61,17 @@ function assertSystemPromptResult(
   assert.equal(typeof Reflect.get(value, "systemPrompt"), "string");
 }
 
+test("Extension entrypoint exposes only the default composition root", () => {
+  assert.deepEqual(Object.keys(telegramEntrypoint), ["default"]);
+});
+
 test("Extension entrypoint wires domain bindings into the pi API", () => {
   const harness = createIndexApiHarness();
   telegramExtension(harness.api);
-  assert.equal(harness.tool()?.name, "telegram_attach");
+  assert.deepEqual(
+    [...harness.tools.keys()],
+    ["telegram_attach", "telegram_message", "telegram_help"],
+  );
   assert.deepEqual(
     [...harness.commands.keys()],
     [
@@ -78,10 +86,13 @@ test("Extension entrypoint wires domain bindings into the pi API", () => {
     [
       "session_start",
       "session_shutdown",
+      "session_before_compact",
+      "session_compact",
       "before_agent_start",
       "model_select",
       "agent_start",
       "tool_execution_start",
+      "tool_execution_update",
       "tool_execution_end",
       "message_start",
       "message_update",
@@ -90,10 +101,13 @@ test("Extension entrypoint wires domain bindings into the pi API", () => {
   );
 });
 
-test("Extension before-agent-start hook appends Telegram-specific guidance", async () => {
+test("Extension before-agent-start hook skips Telegram guidance when unconfigured", async () => {
   const harness = createIndexApiHarness();
   telegramExtension(harness.api);
-  const handler = getRequiredIndexHandler(harness.handlers, "before_agent_start");
+  const handler = getRequiredIndexHandler(
+    harness.handlers,
+    "before_agent_start",
+  );
   const basePrompt = "System base";
   const telegramResult = await handler(
     { systemPrompt: basePrompt, prompt: "[telegram] hello" },
@@ -105,10 +119,6 @@ test("Extension before-agent-start hook appends Telegram-specific guidance", asy
   );
   assertSystemPromptResult(telegramResult);
   assertSystemPromptResult(localResult);
-  assert.match(
-    telegramResult.systemPrompt,
-    /current user message came from Telegram/,
-  );
-  assert.match(telegramResult.systemPrompt, /telegram_attach/);
-  assert.equal(localResult.systemPrompt.includes("came from Telegram"), false);
+  assert.equal(telegramResult.systemPrompt, basePrompt);
+  assert.equal(localResult.systemPrompt, basePrompt);
 });

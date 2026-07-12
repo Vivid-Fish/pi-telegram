@@ -1,5 +1,5 @@
 /**
- * Regression tests for Telegram markdown rendering helpers
+ * Regression tests for Telegram UI/compat rendering helpers
  * Covers nested lists, code blocks, tables, links, quotes, chunking, and other Telegram-specific render edge cases
  */
 
@@ -7,12 +7,10 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
-  buildTelegramPreviewSnapshot,
   chunkHtmlPreservingTags,
   escapeHtml,
   escapeHtmlAttribute,
   MAX_MESSAGE_LENGTH,
-  renderMarkdownPreviewText,
   renderTelegramMessage,
 } from "../lib/rendering.ts";
 
@@ -36,6 +34,48 @@ test("HTML helpers chunk long text while preserving open tags", () => {
 test("HTML helpers do not reopen void tags across chunks", () => {
   const chunks = chunkHtmlPreservingTags(`a<br>${"b".repeat(10)}`, 8);
   assert.deepEqual(chunks, ["a<br>bbb", "bbbbbbbb".slice(0, 7)]);
+});
+
+test("Malformed and boundary markdown renders safely", () => {
+  const cases = [
+    "",
+    "```ts\nconst raw = '**not bold**'",
+    `${"x".repeat(MAX_MESSAGE_LENGTH + 250)} end`,
+    `surrogate-boundary: ${"🙂".repeat(120)}\uD83D`,
+    [
+      "> level 1",
+      "> > level 2",
+      "> > > level 3",
+      "> > > > level 4",
+      "> **bold quote",
+    ].join("\n"),
+  ];
+
+  for (const markdown of cases) {
+    let chunks: ReturnType<typeof renderTelegramMessage> = [];
+    assert.doesNotThrow(() => {
+      chunks = renderTelegramMessage(markdown, { mode: "markdown" });
+    });
+    for (const chunk of chunks) {
+      assert.ok(chunk.text.length <= MAX_MESSAGE_LENGTH);
+      assert.equal(
+        countMatches(chunk.text, /<blockquote>/g),
+        countMatches(chunk.text, /<\/blockquote>/g),
+      );
+      assert.equal(
+        countMatches(chunk.text, /<b>/g),
+        countMatches(chunk.text, /<\/b>/g),
+      );
+      assert.equal(
+        countMatches(chunk.text, /<i>/g),
+        countMatches(chunk.text, /<\/i>/g),
+      );
+      assert.equal(
+        countMatches(chunk.text, /<pre>/g),
+        countMatches(chunk.text, /<\/pre>/g),
+      );
+    }
+  }
 });
 
 test("Nested lists stay out of code blocks", () => {
@@ -74,6 +114,18 @@ test("Underscores inside words do not become italic", () => {
   assert.match(chunks[0]?.text ?? "", /<b>bold<\/b>/);
 });
 
+test("Bold markdown can span soft line breaks", () => {
+  const chunks = renderTelegramMessage(
+    "Скорее: **архитектурно — да,\nпрактически — почти**.",
+    { mode: "markdown" },
+  );
+  assert.equal(chunks.length, 1);
+  assert.match(
+    chunks[0]?.text ?? "",
+    /Скорее: <b>архитектурно — да,\nпрактически — почти<\/b>\./,
+  );
+});
+
 test("Quoted nested lists stay in blockquote rendering", () => {
   const chunks = renderTelegramMessage(
     "> Quoted intro\n> - nested item\n>   - deeper item",
@@ -95,9 +147,8 @@ test("Numbered lists use monospace numeric markers", () => {
   assert.match(chunks[0]?.text ?? "", /<code>2\.<\/code> second/);
 });
 
-test("Ordered task lists preserve numeric markers in previews and final rendering", () => {
+test("Ordered task lists preserve numeric markers in rendering", () => {
   const markdown = "1. [x] first\n2. [ ] second";
-  assert.equal(renderMarkdownPreviewText(markdown), markdown);
   const chunks = renderTelegramMessage(markdown, {
     mode: "markdown",
   });
@@ -114,7 +165,6 @@ test("Ordered task lists preserve numeric markers in previews and final renderin
 
 test("Leading indentation on the first markdown line stays intact", () => {
   const markdown = "  - nested bullet\n    - nested child";
-  assert.equal(renderMarkdownPreviewText(markdown), markdown);
   const chunks = renderTelegramMessage(markdown, {
     mode: "markdown",
   });
@@ -129,12 +179,8 @@ test("Leading indentation on the first markdown line stays intact", () => {
   );
 });
 
-test("Preview and final rendering preserve multiple blank lines between blocks", () => {
+test("UI/compat rendering preserves multiple blank lines between blocks", () => {
   const markdown = "# Title\n\n\nParagraph\n\n\n> Quote";
-  assert.equal(
-    renderMarkdownPreviewText(markdown),
-    "Title\n\n\nParagraph\n\n\n> Quote",
-  );
   const chunks = renderTelegramMessage(markdown, {
     mode: "markdown",
   });
@@ -145,31 +191,25 @@ test("Preview and final rendering preserve multiple blank lines between blocks",
   );
 });
 
-test("Rendering preserves original blank-line spacing across block transitions", () => {
+test("UI/compat rendering preserves original blank-line spacing across block transitions", () => {
   const cases = [
     {
       markdown: "Para\n\n\n```ts\nconst x = 1\n```",
       finalText:
-        'Para\n\n\n<pre><code class="language-ts">const x = 1</code></pre>',
-      previewText:
         'Para\n\n\n<pre><code class="language-ts">const x = 1</code></pre>',
     },
     {
       markdown: "```ts\nconst x = 1\n```\n\n\nPara",
       finalText:
         '<pre><code class="language-ts">const x = 1</code></pre>\n\n\nPara',
-      previewText:
-        '<pre><code class="language-ts">const x = 1</code></pre>\n\n\nPara',
     },
     {
       markdown: "Para\n\n\n- item",
       finalText: "Para\n\n\n<code>-</code> item",
-      previewText: "Para\n\n\n- item",
     },
     {
       markdown: "Para\n\n\n> Quote",
       finalText: "Para\n\n\n<blockquote>Quote</blockquote>",
-      previewText: "Para\n\n\n&gt; Quote",
     },
   ];
   for (const testCase of cases) {
@@ -178,13 +218,6 @@ test("Rendering preserves original blank-line spacing across block transitions",
     });
     assert.equal(finalChunks.length, 1);
     assert.equal(finalChunks[0]?.text ?? "", testCase.finalText);
-    const preview = buildTelegramPreviewSnapshot({
-      state: { pendingText: testCase.markdown, lastSentText: "" },
-      maxMessageLength: MAX_MESSAGE_LENGTH,
-      renderPreviewText: renderMarkdownPreviewText,
-      renderTelegramMessage: renderTelegramMessage,
-    });
-    assert.equal(preview?.text ?? "", testCase.previewText);
   }
 });
 
@@ -202,7 +235,6 @@ test("Headings keep visible spacing before following code blocks even without so
 
 test("Standalone checkbox-looking prose stays literal outside task lists", () => {
   const markdown = "Use [ ] as a placeholder and keep [x] literal";
-  assert.equal(renderMarkdownPreviewText(markdown), markdown);
   const chunks = renderTelegramMessage(markdown, {
     mode: "markdown",
   });
@@ -225,7 +257,7 @@ test("Nested blockquotes flatten into one Telegram blockquote with indentation",
   assert.match(chunks[0]?.text ?? "", /\u00A0\u00A0\u00A0\u00A0deepest/);
 });
 
-test("Markdown tables render as literal monospace blocks without outer side borders", () => {
+test("UI/compat Markdown tables render as literal monospace blocks without outer side borders", () => {
   const chunks = renderTelegramMessage(
     "| Name | Value |\n| --- | --- |\n| **x** | `y` |",
     { mode: "markdown" },
@@ -389,7 +421,7 @@ test("Long quoted blocks stay chunked with balanced blockquote tags", () => {
   }
 });
 
-test("Long markdown replies stay chunked below Telegram limits", () => {
+test("Long UI/compat Markdown messages stay chunked below Telegram limits", () => {
   const markdown = Array.from(
     { length: 600 },
     (_, index) => `- item **${index}**`,
@@ -537,10 +569,10 @@ test("Long inline formatting paragraphs stay balanced across chunk boundaries", 
   }
 });
 
-test("Realistic model output fixtures render safely", () => {
+test("Realistic Markdown fixtures render safely for UI/compat surfaces", () => {
   const fixtures = [
     [
-      "Here is the migration plan:",
+      "Here is the UI action plan:",
       "",
       "1. [x] Snapshot the database",
       "2. [ ] Apply the patch with `pnpm db:migrate`",
@@ -569,7 +601,7 @@ test("Realistic model output fixtures render safely", () => {
       '{ "markdown": "**not bold**", "path": "foo_bar/baz" }',
       "```",
       "",
-      "Nested quote from model output:",
+      "Nested quote from interactive compatibility message:",
       "> outer",
       ">> inner with **bold**",
     ].join("\n"),

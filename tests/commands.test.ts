@@ -7,7 +7,11 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  buildTelegramAppMenuHtml,
   buildTelegramCommandAction,
+  isTelegramReservedCommandName,
+  formatTelegramCommandEmojiPrefix,
+  createTelegramAppMenuHtmlBuilder,
   createTelegramBotCommandRegistrar,
   createTelegramCommandControlEnqueueAdapter,
   createTelegramCommandControlQueueRuntime,
@@ -19,16 +23,23 @@ import {
   executeTelegramCommandAction,
   getTelegramCommandExecutionMode,
   getTelegramCommandMessageTarget,
+  clearTelegramExtensionCommands,
+  findTelegramExtensionCommand,
+  handleTelegramAbortCommand,
   handleTelegramCompactCommand,
-  handleTelegramHelpCommand,
+  handleTelegramCompactConfirmationCallback,
   handleTelegramModelCommand,
   handleTelegramStatusCommand,
   handleTelegramStopCommand,
   parseTelegramCommand,
   registerTelegramBotCommands,
+  registerTelegramCommand,
   registerTelegramBridgeCommands,
+  TELEGRAM_APP_MENU_INTRO_HTML,
   TELEGRAM_BOT_COMMANDS,
-  TELEGRAM_HELP_TEXT,
+  TELEGRAM_COMMAND_ACTIONS,
+  TELEGRAM_COMMAND_EMOJI,
+  TELEGRAM_RESERVED_COMMAND_NAMES,
 } from "../lib/commands.ts";
 import type { ExtensionAPI, ExtensionCommandContext } from "../lib/pi.ts";
 
@@ -58,12 +69,14 @@ function getRequiredCommand(
 function createBridgeCommandContext(
   notify: (message: string) => void = () => {},
   confirm: () => Promise<boolean> | boolean = () => false,
+  select?: (title: string, items: string[]) => Promise<string | undefined>,
 ): ExtensionCommandContext {
   return {
     cwd: "/repo",
     ui: {
       notify,
       confirm,
+      select,
       theme: {
         fg: (_color: string, value: string) => value,
       },
@@ -72,22 +85,33 @@ function createBridgeCommandContext(
 }
 
 test("Command helpers expose Telegram bot command definitions", () => {
-  assert.deepEqual(TELEGRAM_BOT_COMMANDS, [
+  assert.deepEqual(TELEGRAM_COMMAND_EMOJI.model, "🤖");
+  assert.deepEqual(TELEGRAM_COMMAND_EMOJI.thinking, "🧠");
+  assert.equal(formatTelegramCommandEmojiPrefix("model"), "🤖 ");
+  const expectedBuiltins = [
     {
       command: "start",
-      description: "Show help and pair the Telegram bridge",
+      description: "🟢 Open menu / Pair bridge",
+    },
+    { command: "compact", description: "🗜 Compact current session" },
+    {
+      command: "next",
+      description: "⏩ Force next turn",
     },
     {
-      command: "status",
-      description: "Show model, usage, cost, and context status",
+      command: "continue",
+      description: "▶️ Queue continue prompt",
     },
-    { command: "model", description: "Open the interactive model selector" },
-    { command: "compact", description: "Compact the current pi session" },
+    {
+      command: "abort",
+      description: "⏹️ Abort Pi",
+    },
     {
       command: "stop",
-      description: "Abort the current pi task and clear queued turns",
+      description: "🟥 Abort Pi & Clear queue",
     },
-  ]);
+  ];
+  assert.deepEqual(TELEGRAM_BOT_COMMANDS, expectedBuiltins);
 });
 
 test("Command helpers register Telegram bot commands through deps", async () => {
@@ -103,6 +127,94 @@ test("Command helpers register Telegram bot commands through deps", async () => 
     },
   })();
   assert.deepEqual(calls, [TELEGRAM_BOT_COMMANDS, TELEGRAM_BOT_COMMANDS]);
+});
+
+test("Command helpers keep extension Telegram bot commands hidden by default", async () => {
+  clearTelegramExtensionCommands();
+  const dispose = registerTelegramCommand({
+    name: "new",
+    description: "Start fresh",
+    handler: async () => {},
+  });
+  const calls: unknown[] = [];
+  await registerTelegramBotCommands({
+    setMyCommands: async (commands) => {
+      calls.push(commands);
+    },
+  });
+  assert.deepEqual(calls, [TELEGRAM_BOT_COMMANDS]);
+  dispose();
+  clearTelegramExtensionCommands();
+});
+
+test("Command helpers register extension Telegram bot commands when visible", async () => {
+  clearTelegramExtensionCommands();
+  const dispose = registerTelegramCommand({
+    name: "new",
+    description: "Start fresh",
+    showInMenu: true,
+    emoji: "🆕",
+    handler: async () => {},
+  });
+  const calls: unknown[] = [];
+  await registerTelegramBotCommands({
+    setMyCommands: async (commands) => {
+      calls.push(commands);
+    },
+  });
+  assert.deepEqual(calls, [
+    [
+      TELEGRAM_BOT_COMMANDS[0],
+      TELEGRAM_BOT_COMMANDS[1],
+      { command: "new", description: "🆕 Start fresh" },
+      ...TELEGRAM_BOT_COMMANDS.slice(2),
+    ],
+  ]);
+  dispose();
+  clearTelegramExtensionCommands();
+});
+
+test("Command helpers reject visible extension commands without emoji", () => {
+  clearTelegramExtensionCommands();
+  assert.throws(
+    () =>
+      registerTelegramCommand({
+        name: "new",
+        showInMenu: true,
+        handler: () => {},
+      }),
+    /requires emoji/,
+  );
+  clearTelegramExtensionCommands();
+});
+
+test("Command helpers reject invalid and built-in extension command names", () => {
+  clearTelegramExtensionCommands();
+  assert.throws(
+    () => registerTelegramCommand({ name: "compact-all", handler: () => {} }),
+    /Invalid Telegram command name/,
+  );
+  assert.throws(
+    () => registerTelegramCommand({ name: "start", handler: () => {} }),
+    /conflicts with built-in command/,
+  );
+  clearTelegramExtensionCommands();
+});
+
+test("Command helpers register disposable extension commands", () => {
+  clearTelegramExtensionCommands();
+  const dispose = registerTelegramCommand({
+    name: "/new",
+    handler: () => {},
+  });
+  assert.equal(findTelegramExtensionCommand("new")?.name, "new");
+  assert.throws(
+    () => registerTelegramCommand({ name: "new", handler: () => {} }),
+    /already registered/,
+  );
+  dispose();
+  assert.equal(findTelegramExtensionCommand("new"), undefined);
+  clearTelegramExtensionCommands();
 });
 
 test("Command helpers register pi setup and status commands", async () => {
@@ -132,7 +244,10 @@ test("Command helpers register pi setup and status commands", async () => {
     notifications.push(message);
   });
   await getRequiredCommand(harness.commands, "telegram-setup").handler("", ctx);
-  await getRequiredCommand(harness.commands, "telegram-status").handler("", ctx);
+  await getRequiredCommand(harness.commands, "telegram-status").handler(
+    "",
+    ctx,
+  );
   assert.deepEqual(events, ["setup"]);
   assert.deepEqual(notifications, ["bot: @demo\npolling: stopped"]);
 });
@@ -161,10 +276,19 @@ test("Command helpers register pi connect and disconnect commands", async () => 
     },
   });
   const ctx = createBridgeCommandContext();
-  await getRequiredCommand(harness.commands, "telegram-connect").handler("", ctx);
+  await getRequiredCommand(harness.commands, "telegram-connect").handler(
+    "",
+    ctx,
+  );
   hasToken = true;
-  await getRequiredCommand(harness.commands, "telegram-connect").handler("", ctx);
-  await getRequiredCommand(harness.commands, "telegram-disconnect").handler("", ctx);
+  await getRequiredCommand(harness.commands, "telegram-connect").handler(
+    "",
+    ctx,
+  );
+  await getRequiredCommand(harness.commands, "telegram-disconnect").handler(
+    "",
+    ctx,
+  );
   assert.deepEqual(events, [
     "reload",
     "setup",
@@ -207,7 +331,10 @@ test("Command helpers move pi polling ownership after confirmation", async () =>
       return true;
     },
   );
-  await getRequiredCommand(harness.commands, "telegram-connect").handler("", ctx);
+  await getRequiredCommand(harness.commands, "telegram-connect").handler(
+    "",
+    ctx,
+  );
   assert.deepEqual(events, [
     "reload",
     "start",
@@ -237,7 +364,15 @@ test("Command helpers ignore non-command input and empty names", () => {
 test("Command helpers resolve message reply targets", () => {
   assert.deepEqual(
     getTelegramCommandMessageTarget({ chat: { id: 1 }, message_id: 2 }),
-    { chatId: 1, replyToMessageId: 2 },
+    { chatId: 1, replyToMessageId: 2, threadId: undefined },
+  );
+  assert.deepEqual(
+    getTelegramCommandMessageTarget({
+      chat: { id: 1 },
+      message_id: 2,
+      message_thread_id: 42,
+    }),
+    { chatId: 1, replyToMessageId: 2, threadId: 42 },
   );
 });
 
@@ -360,17 +495,19 @@ test("Command target runtime binds chat reply targets to command ports", async (
       );
       void execute(ctx);
     },
-    showStatus: async (chatId, replyToMessageId, ctx) => {
-      calls.push(`status:${chatId}:${replyToMessageId}:${ctx}`);
+    showStatus: async (chatId, replyToMessageId, ctx, threadId) => {
+      calls.push(`status:${chatId}:${replyToMessageId}:${ctx}:${threadId}`);
     },
-    openModelMenu: async (chatId, replyToMessageId, ctx) => {
-      calls.push(`model:${chatId}:${replyToMessageId}:${ctx}`);
+    openModelMenu: async (chatId, replyToMessageId, ctx, threadId) => {
+      calls.push(`model:${chatId}:${replyToMessageId}:${ctx}:${threadId}`);
     },
-    sendTextReply: async (chatId, replyToMessageId, text) => {
-      calls.push(`reply:${chatId}:${replyToMessageId}:${text}`);
+    sendTextReply: async (chatId, replyToMessageId, text, options) => {
+      calls.push(
+        `reply:${chatId}:${replyToMessageId}:${text}:${options?.target?.threadId}`,
+      );
     },
   });
-  const message = { chat: { id: 7 }, message_id: 11 };
+  const message = { chat: { id: 7 }, message_id: 11, message_thread_id: 42 };
   runtime.enqueueControlItem(
     message,
     "ctx",
@@ -382,13 +519,15 @@ test("Command target runtime binds chat reply targets to command ports", async (
   );
   await runtime.showStatus(message, "ctx");
   await runtime.openModelMenu(message, "ctx");
+  await runtime.openSettingsMenu(message, "ctx");
   await runtime.sendTextReply(message, "hello");
   assert.deepEqual(calls, [
     "enqueue:7:11:ctx:status:⚡ status",
     "execute",
-    "status:7:11:ctx",
-    "model:7:11:ctx",
-    "reply:7:11:hello",
+    "status:7:11:ctx:42",
+    "model:7:11:ctx:42",
+    "reply:7:11:Settings menu is unavailable.:42",
+    "reply:7:11:hello:42",
   ]);
 });
 
@@ -409,6 +548,10 @@ test("Command helpers build command actions", () => {
     kind: "model",
     executionMode: "immediate",
   });
+  assert.deepEqual(buildTelegramCommandAction("continue"), {
+    kind: "continue",
+    executionMode: "immediate",
+  });
   assert.deepEqual(buildTelegramCommandAction("help"), {
     kind: "help",
     commandName: "help",
@@ -419,6 +562,11 @@ test("Command helpers build command actions", () => {
     commandName: "start",
     executionMode: "immediate",
   });
+  assert.deepEqual(Object.keys(TELEGRAM_COMMAND_ACTIONS), [
+    ...TELEGRAM_RESERVED_COMMAND_NAMES,
+  ]);
+  assert.equal(isTelegramReservedCommandName("start"), true);
+  assert.equal(isTelegramReservedCommandName("unknown"), false);
   assert.deepEqual(buildTelegramCommandAction("unknown"), {
     kind: "ignore",
     executionMode: "ignored",
@@ -435,6 +583,7 @@ test("Command execution mode contract keeps Telegram controls immediate", () => 
     ["compact", "immediate"],
     ["help", "immediate"],
     ["start", "immediate"],
+    ["continue", "immediate"],
     ["status", "immediate"],
     ["model", "immediate"],
     ["unknown", "ignored"],
@@ -460,8 +609,8 @@ test("Command helpers run stop command side effects", async () => {
       events.push("clear-queue:2");
       return 2;
     },
-    setPreserveQueuedTurnsAsHistory: (preserve) => {
-      events.push(`preserve:${preserve}`);
+    setFoldQueuedPromptsIntoHistory: (fold) => {
+      events.push(`fold:${fold}`);
     },
     abortCurrentTurn: () => {
       events.push("unexpected:abort");
@@ -482,8 +631,8 @@ test("Command helpers run stop command side effects", async () => {
       events.push("clear-queue:1");
       return 1;
     },
-    setPreserveQueuedTurnsAsHistory: (preserve) => {
-      events.push(`preserve:${preserve}`);
+    setFoldQueuedPromptsIntoHistory: (fold) => {
+      events.push(`fold:${fold}`);
     },
     abortCurrentTurn: () => {
       events.push("abort");
@@ -498,15 +647,57 @@ test("Command helpers run stop command side effects", async () => {
   assert.deepEqual(events, [
     "clear",
     "clear-queue:2",
-    "preserve:false",
+    "fold:false",
     "status",
     "reply:No active turn. Cleared 2 queued turns.",
     "clear",
     "clear-queue:1",
-    "preserve:false",
+    "fold:false",
     "abort",
     "status",
     "reply:Aborted current turn. Cleared 1 queued turn.",
+  ]);
+});
+
+test("Command helpers scope abort history preservation to Telegram-owned turns", async () => {
+  const events: string[] = [];
+  const baseDeps = {
+    hasAbortHandler: () => true,
+    clearPendingModelSwitch: () => {
+      events.push("clear");
+    },
+    abortCurrentTurn: () => {
+      events.push("abort");
+    },
+    setFoldQueuedPromptsIntoHistory: (fold: boolean) => {
+      events.push(`fold:${fold}`);
+    },
+    updateStatus: () => {
+      events.push("status");
+    },
+    sendTextReply: async (text: string) => {
+      events.push(`reply:${text}`);
+    },
+  };
+  await handleTelegramAbortCommand({
+    ...baseDeps,
+    hasActiveTelegramTurn: () => true,
+  });
+  await handleTelegramAbortCommand({
+    ...baseDeps,
+    hasActiveTelegramTurn: () => false,
+  });
+  assert.deepEqual(events, [
+    "clear",
+    "fold:true",
+    "abort",
+    "status",
+    "reply:Aborted current turn.",
+    "clear",
+    "fold:false",
+    "abort",
+    "status",
+    "reply:Aborted current turn.",
   ]);
 });
 
@@ -556,22 +747,195 @@ test("Command helpers guard and complete compact command flow", async () => {
       events.push("compact");
       complete = callbacks.onComplete;
     },
+    startTypingLoop: () => {
+      events.push("typing:start");
+    },
+    stopTypingLoop: () => {
+      events.push("typing:stop");
+    },
     sendTextReply: async (text) => {
       events.push(`reply:${text}`);
     },
   });
   complete?.();
   assert.deepEqual(events, [
-    "reply:Cannot compact while pi or the Telegram queue is busy. Wait for queued turns to finish or send /stop first.",
+    "reply:Cannot compact while Pi or the Telegram queue is busy. Wait for queued turns to finish or send /abort first.",
     "set:true",
     "status",
+    "typing:start",
     "compact",
-    "reply:Compaction started.",
+    "reply:🗜 Compaction started.",
+    "typing:stop",
     "set:false",
     "status",
     "dispatch",
-    "reply:Compaction completed.",
+    "reply:✅ Compaction completed.",
   ]);
+});
+
+test("Command helpers open compact confirmation and handle callbacks", async () => {
+  const events: string[] = [];
+  const message = { chat: { id: 42 }, message_id: 99, message_thread_id: 123 };
+  const handleCommand = createTelegramCommandHandler({
+    hasAbortHandler: () => false,
+    clearPendingModelSwitch: () => {},
+    hasQueuedTelegramItems: () => false,
+    clearQueuedTelegramItems: () => 0,
+    setFoldQueuedPromptsIntoHistory: () => {},
+    abortCurrentTurn: () => {},
+    isIdle: () => true,
+    hasPendingMessages: () => false,
+    hasActiveTelegramTurn: () => false,
+    hasDispatchPending: () => false,
+    isCompactionInProgress: () => false,
+    setCompactionInProgress: () => {
+      events.push("unexpected:compact");
+    },
+    updateStatus: () => {},
+    dispatchNextQueuedTelegramTurn: () => {},
+    compact: () => {},
+    enqueueContinueTurn: async () => {},
+    enqueueControlItem: () => {},
+    showStatus: async () => {},
+    openModelMenu: async () => {},
+    openThinkingMenu: async () => {},
+    openQueueMenu: async () => {},
+    getAllowedUserId: () => 1,
+    setAllowedUserId: () => {},
+    registerBotCommands: async () => {},
+    persistConfig: async () => {},
+    sendTextReply: async () => {},
+    sendInteractiveMessage: async (
+      chatId,
+      text,
+      mode,
+      replyMarkup,
+      options,
+    ) => {
+      events.push(`${chatId}:${mode}:${text}`);
+      events.push(JSON.stringify(replyMarkup.inline_keyboard));
+      events.push(JSON.stringify(options));
+      return 77;
+    },
+  });
+  assert.equal(await handleCommand("compact", message, {}), true);
+  assert.deepEqual(events, [
+    "42:html:<b>Compact session?</b>",
+    '[[{"text":"🗜 Yes, compact","callback_data":"compact:confirm"},{"text":"❌ No","callback_data":"compact:cancel"}]]',
+    '{"target":{"chatId":42,"threadId":123}}',
+  ]);
+  events.length = 0;
+  const cancelled = await handleTelegramCompactConfirmationCallback(
+    {
+      id: "cb-cancel",
+      data: "compact:cancel",
+      message: { chat: { id: 42 }, message_id: 77 },
+    },
+    {
+      ctx: {},
+      answerCallbackQuery: async (id) => {
+        events.push(`answer:${id}`);
+      },
+      editInteractiveMessage: async (chatId, messageId, text, mode, markup) => {
+        events.push(`${chatId}:${messageId}:${mode}:${text}`);
+        events.push(JSON.stringify(markup.inline_keyboard));
+      },
+      runCompact: async () => {
+        events.push("unexpected:run");
+      },
+    },
+  );
+  assert.equal(cancelled, true);
+  assert.deepEqual(events, [
+    "42:77:plain:Compaction cancelled.",
+    "[]",
+    "answer:cb-cancel",
+  ]);
+  events.length = 0;
+  const confirmed = await handleTelegramCompactConfirmationCallback(
+    {
+      id: "cb-confirm",
+      data: "compact:confirm",
+      message: { chat: { id: 42 }, message_id: 77, message_thread_id: 123 },
+    },
+    {
+      ctx: { id: "ctx" },
+      answerCallbackQuery: async (id) => {
+        events.push(`answer:${id}`);
+      },
+      editInteractiveMessage: async (chatId, messageId, text, mode, markup) => {
+        events.push(`${chatId}:${messageId}:${mode}:${text}`);
+        events.push(JSON.stringify(markup.inline_keyboard));
+      },
+      runCompact: async (ctx, chatId, messageId, target) => {
+        events.push(
+          `run:${(ctx as { id: string }).id}:${chatId}:${messageId}:${target?.chatId}:${target?.threadId}`,
+        );
+      },
+    },
+  );
+  assert.equal(confirmed, true);
+  assert.deepEqual(events, [
+    "42:77:plain:🗜 Compaction started.",
+    "[]",
+    "answer:cb-confirm",
+    "run:ctx:42:77:42:123",
+  ]);
+});
+
+test("Command helpers defer compact-complete queue dispatch", async () => {
+  const events: string[] = [];
+  let complete: (() => void) | undefined;
+  let deferredDispatch: (() => void) | undefined;
+  await handleTelegramCompactCommand({
+    isIdle: () => true,
+    hasPendingMessages: () => false,
+    hasActiveTelegramTurn: () => false,
+    hasDispatchPending: () => false,
+    hasQueuedTelegramItems: () => false,
+    isCompactionInProgress: () => false,
+    setCompactionInProgress: (inProgress) => {
+      events.push(`set:${inProgress}`);
+    },
+    updateStatus: () => {
+      events.push("status");
+    },
+    dispatchNextQueuedTelegramTurn: () => {
+      events.push("dispatch");
+    },
+    requestDeferredDispatchNextQueuedTelegramTurn: (dispatch) => {
+      events.push("defer");
+      deferredDispatch = dispatch;
+    },
+    compact: (callbacks) => {
+      events.push("compact");
+      complete = callbacks.onComplete;
+    },
+    startTypingLoop: () => {
+      events.push("typing:start");
+    },
+    stopTypingLoop: () => {
+      events.push("typing:stop");
+    },
+    sendTextReply: async (text) => {
+      events.push(`reply:${text}`);
+    },
+  });
+  complete?.();
+  assert.deepEqual(events, [
+    "set:true",
+    "status",
+    "typing:start",
+    "compact",
+    "reply:🗜 Compaction started.",
+    "typing:stop",
+    "set:false",
+    "status",
+    "defer",
+    "reply:✅ Compaction completed.",
+  ]);
+  deferredDispatch?.();
+  assert.deepEqual(events.at(-1), "dispatch");
 });
 
 test("Command helpers report compact errors", async () => {
@@ -601,6 +965,12 @@ test("Command helpers report compact errors", async () => {
       events.push("compact");
       fail = callbacks.onError;
     },
+    startTypingLoop: () => {
+      events.push("typing:start");
+    },
+    stopTypingLoop: () => {
+      events.push("typing:stop");
+    },
     sendTextReply: async (text) => {
       events.push(`reply:${text}`);
     },
@@ -624,6 +994,12 @@ test("Command helpers report compact errors", async () => {
     compact: () => {
       throw new Error("sync boom");
     },
+    startTypingLoop: () => {
+      events.push("throw-typing:start");
+    },
+    stopTypingLoop: () => {
+      events.push("throw-typing:stop");
+    },
     sendTextReply: async (text) => {
       events.push(`reply:${text}`);
     },
@@ -632,8 +1008,10 @@ test("Command helpers report compact errors", async () => {
   assert.deepEqual(events, [
     "set:true",
     "status",
+    "typing:start",
     "compact",
-    "reply:Compaction started.",
+    "reply:🗜 Compaction started.",
+    "typing:stop",
     "set:false",
     "status",
     "dispatch",
@@ -641,6 +1019,8 @@ test("Command helpers report compact errors", async () => {
     "reply:Compaction failed: boom",
     "throw-set:true",
     "throw-status",
+    "throw-typing:start",
+    "throw-typing:stop",
     "throw-set:false",
     "throw-status",
     "event:compact:sync boom",
@@ -665,96 +1045,86 @@ test("Command helpers execute status and model controls immediately", async () =
   assert.deepEqual(events, ["show:ctx", "model:ctx"]);
 });
 
-test("Command helpers send help, register start commands, and pair first sender", async () => {
-  const events: string[] = [];
-  let allowedUserId: number | undefined;
-  await handleTelegramHelpCommand("help", {
-    senderUserId: 7,
-    getAllowedUserId: () => allowedUserId,
-    setAllowedUserId: (userId) => {
-      allowedUserId = userId;
-      events.push(`pair:${userId}`);
-    },
-    registerBotCommands: async () => {
-      events.push("unexpected:register");
-    },
-    persistConfig: async () => {
-      events.push("persist");
-    },
-    updateStatus: () => {
-      events.push("status");
-    },
-    sendTextReply: async (text) => {
-      events.push(`reply:${text}`);
+test("Command menu controls swallow only stale context errors", async () => {
+  await handleTelegramStatusCommand({
+    ctx: "ctx",
+    showStatus: async () => {
+      throw new Error("ctx is stale after session reload");
     },
   });
-  await handleTelegramHelpCommand("start", {
-    senderUserId: 8,
-    getAllowedUserId: () => allowedUserId,
-    setAllowedUserId: (userId) => {
-      allowedUserId = userId;
-      events.push(`unexpected:pair:${userId}`);
-    },
-    registerBotCommands: async () => {
-      events.push("register");
-    },
-    persistConfig: async () => {
-      events.push("unexpected:persist");
-    },
-    updateStatus: () => {
-      events.push("unexpected:status");
-    },
-    sendTextReply: async (text) => {
-      events.push(`reply:${text}`);
-    },
-  });
-  assert.equal(allowedUserId, 7);
-  assert.deepEqual(events, [
-    `reply:${TELEGRAM_HELP_TEXT}`,
-    "pair:7",
-    "persist",
-    "status",
-    "register",
-    `reply:${TELEGRAM_HELP_TEXT}`,
-  ]);
+  await assert.rejects(
+    () =>
+      handleTelegramModelCommand({
+        ctx: "ctx",
+        openModelMenu: async () => {
+          throw new Error("menu broke");
+        },
+      }),
+    /menu broke/,
+  );
 });
 
-test("Command helpers include start registration warnings in help replies", async () => {
-  const events: string[] = [];
-  await handleTelegramHelpCommand("start", {
-    getAllowedUserId: () => 1,
-    setAllowedUserId: () => {
-      events.push("unexpected:pair");
-    },
-    registerBotCommands: async () => {
-      throw new Error("menu unavailable");
-    },
-    persistConfig: async () => {
-      events.push("unexpected:persist");
-    },
-    updateStatus: () => {
-      events.push("unexpected:status");
-    },
-    sendTextReply: async (text) => {
-      events.push(text);
-    },
+test("Command helpers build the unified app menu from commands and status", () => {
+  clearTelegramExtensionCommands();
+  assert.equal(
+    buildTelegramAppMenuHtml(
+      "<b>Status:</b> <code>idle</code>\n<b>Context:</b> <code>1%</code>",
+    ),
+    `${TELEGRAM_APP_MENU_INTRO_HTML}\n\n<b>Status:</b> <code>idle</code>\n<b>Context:</b> <code>1%</code>`,
+  );
+  assert.equal(
+    buildTelegramAppMenuHtml("<b>Status:</b> <code>idle</code>", [
+      { command: "review", description: "Review <changes>\nWith details" },
+    ]),
+    `${TELEGRAM_APP_MENU_INTRO_HTML}\n\n🧩 /review\n\n<b>Status:</b> <code>idle</code>`,
+  );
+  const dispose = registerTelegramCommand({
+    name: "new",
+    description: "Start fresh",
+    showInMenu: true,
+    emoji: "🆕",
+    handler: () => {},
   });
-  assert.deepEqual(events, [
-    `${TELEGRAM_HELP_TEXT}\n\nWarning: failed to register bot commands menu: menu unavailable`,
-  ]);
+  const menuWithExtensionCommand = TELEGRAM_APP_MENU_INTRO_HTML.replace(
+    "⏩ /next — Force next turn",
+    "🆕 /new — Start fresh\n⏩ /next — Force next turn",
+  );
+  assert.equal(
+    buildTelegramAppMenuHtml("<b>Status:</b> <code>idle</code>"),
+    `${menuWithExtensionCommand}\n\n<b>Status:</b> <code>idle</code>`,
+  );
+  assert.equal(
+    buildTelegramAppMenuHtml("<b>Status:</b> <code>idle</code>", [
+      { command: "review", description: "Review changes" },
+    ]),
+    `${menuWithExtensionCommand}\n\n🧩 /review\n\n<b>Status:</b> <code>idle</code>`,
+  );
+  dispose();
+  clearTelegramExtensionCommands();
+  const buildAppMenuHtml = createTelegramAppMenuHtmlBuilder({
+    buildStatusHtml: (ctx: string) => `<b>Status ${ctx}</b>`,
+  });
+  assert.equal(
+    buildAppMenuHtml("ctx"),
+    `${TELEGRAM_APP_MENU_INTRO_HTML}\n\n<b>Status ctx</b>`,
+  );
 });
 
 test("Command handler target runtime binds command targets into command handling", async () => {
   const calls: string[] = [];
   const handleCommand = createTelegramCommandHandlerTargetRuntime<
-    { chat: { id: number }; message_id: number },
+    {
+      chat: { id: number; type?: string };
+      message_id: number;
+      from?: { id?: number };
+    },
     string
   >({
     hasAbortHandler: () => false,
     clearPendingModelSwitch: () => {},
     hasQueuedTelegramItems: () => false,
     clearQueuedTelegramItems: () => 0,
-    setPreserveQueuedTurnsAsHistory: () => {},
+    setFoldQueuedPromptsIntoHistory: () => {},
     abortCurrentTurn: () => {},
     isIdle: () => true,
     hasPendingMessages: () => false,
@@ -765,6 +1135,9 @@ test("Command handler target runtime binds command targets into command handling
     updateStatus: () => {},
     dispatchNextQueuedTelegramTurn: (ctx) => {
       calls.push(`dispatch:${ctx}`);
+    },
+    enqueueContinueTurn: async (_message, ctx) => {
+      calls.push(`continue:${ctx}`);
     },
     compact: () => {},
     allocateItemOrder: () => 0,
@@ -778,22 +1151,43 @@ test("Command handler target runtime binds command targets into command handling
       calls.push(`show:${ctx}`);
     },
     openModelMenu: async () => {},
-    getAllowedUserId: () => undefined,
+    openThinkingMenu: async () => {},
+    openQueueMenu: async () => {},
+    getAllowedUserId: () => 7,
     setAllowedUserId: () => {},
     setMyCommands: async () => {},
     persistConfig: async () => {},
-    sendTextReply: async () => {},
+    sendTextReply: async (_chatId, _replyToMessageId, text) => {
+      calls.push(`reply:${text}`);
+    },
   });
   assert.equal(
     await handleCommand("status", { chat: { id: 7 }, message_id: 11 }, "ctx"),
     true,
   );
-  assert.deepEqual(calls, ["show:ctx"]);
+  assert.equal(
+    await handleCommand(
+      "start",
+      {
+        chat: { id: -1007, type: "supergroup" },
+        message_id: 12,
+        from: { id: 7 },
+      },
+      "ctx",
+    ),
+    true,
+  );
+  assert.deepEqual(calls, ["show:ctx", "show:ctx"]);
 });
 
 test("Command runtime routes commands through runtime ports", async () => {
   const events: string[] = [];
-  const message = { chat: { id: 42 }, message_id: 99, from: { id: 7 } };
+  const message = {
+    chat: { id: 42 },
+    message_id: 99,
+    message_thread_id: 123,
+    from: { id: 7 },
+  };
   let allowedUserId: number | undefined;
   let compactComplete: (() => void) | undefined;
   const deps = {
@@ -806,8 +1200,8 @@ test("Command runtime routes commands through runtime ports", async () => {
       events.push("clear-queue");
       return 0;
     },
-    setPreserveQueuedTurnsAsHistory: (preserve: boolean) => {
-      events.push(`preserve:${preserve}`);
+    setFoldQueuedPromptsIntoHistory: (fold: boolean) => {
+      events.push(`fold:${fold}`);
     },
     abortCurrentTurn: () => {
       events.push("abort");
@@ -833,6 +1227,18 @@ test("Command runtime routes commands through runtime ports", async () => {
       events.push("compact:start");
       compactComplete = callbacks.onComplete;
     },
+    startTypingLoop: (
+      _ctx: { idle: boolean },
+      chatId?: number,
+      options?: { target?: { chatId: number; threadId?: number } },
+    ) => {
+      events.push(
+        `typing:start:${chatId ?? "default"}:${options?.target?.chatId ?? "none"}:${options?.target?.threadId ?? "all"}`,
+      );
+    },
+    stopTypingLoop: () => {
+      events.push("typing:stop");
+    },
     enqueueControlItem: async (
       nextMessage: typeof message,
       _ctx: { idle: boolean },
@@ -845,11 +1251,20 @@ test("Command runtime routes commands through runtime ports", async () => {
       );
       await execute({ idle: true });
     },
+    enqueueContinueTurn: async (nextMessage: typeof message) => {
+      events.push(`continue:${nextMessage.message_id}`);
+    },
     showStatus: async (nextMessage: typeof message) => {
       events.push(`show:${nextMessage.chat.id}`);
     },
     openModelMenu: async (nextMessage: typeof message) => {
       events.push(`model:${nextMessage.chat.id}`);
+    },
+    openThinkingMenu: async (nextMessage: typeof message) => {
+      events.push(`thinking:${nextMessage.chat.id}`);
+    },
+    openQueueMenu: async (nextMessage: typeof message) => {
+      events.push(`queue:${nextMessage.chat.id}`);
     },
     getAllowedUserId: () => allowedUserId,
     setAllowedUserId: (userId: number) => {
@@ -869,8 +1284,12 @@ test("Command runtime routes commands through runtime ports", async () => {
   const handleCommand = createTelegramCommandHandler(deps);
   assert.equal(await handleCommand("status", message, { idle: true }), true);
   assert.equal(await handleCommand("model", message, { idle: true }), true);
+  assert.equal(await handleCommand("thinking", message, { idle: true }), true);
   assert.equal(await handleCommand("debug", message, { idle: true }), false);
   assert.equal(await handleCommand("start", message, { idle: true }), true);
+  assert.equal(await handleCommand("help", message, { idle: true }), true);
+  assert.equal(await handleCommand("continue", message, { idle: true }), true);
+  assert.equal(await handleCommand("continue", message, { idle: false }), true);
   assert.equal(await handleCommand("compact", message, { idle: true }), true);
   compactComplete?.();
   assert.equal(await handleCommand("stop", message, { idle: true }), true);
@@ -879,26 +1298,88 @@ test("Command runtime routes commands through runtime ports", async () => {
   assert.deepEqual(events, [
     "show:42",
     "model:42",
+    "thinking:42",
     "register",
-    `reply:99:${TELEGRAM_HELP_TEXT}`,
     "pair:7",
     "persist",
     "status",
+    "show:42",
+    "register",
+    "show:42",
+    "continue:99",
+    "continue:99",
     "compact:true",
     "status",
+    "typing:start:42:42:123",
     "compact:start",
-    "reply:99:Compaction started.",
+    "reply:99:🗜 Compaction started.",
+    "typing:stop",
     "compact:false",
     "status",
     "dispatch",
-    "reply:99:Compaction completed.",
+    "reply:99:✅ Compaction completed.",
     "clear-switch",
     "clear-queue",
-    "preserve:false",
+    "fold:false",
     "abort",
     "status",
     "reply:99:Aborted current turn.",
   ]);
+});
+
+test("Command runtime does not first-pair from group start", async () => {
+  const events: string[] = [];
+  let allowedUserId: number | undefined;
+  const message = {
+    chat: { id: -1001, type: "supergroup" },
+    message_id: 55,
+    from: { id: 77 },
+  };
+  const handleCommand = createTelegramCommandHandler({
+    hasAbortHandler: () => false,
+    clearPendingModelSwitch: () => {},
+    hasQueuedTelegramItems: () => false,
+    clearQueuedTelegramItems: () => 0,
+    setFoldQueuedPromptsIntoHistory: () => {},
+    abortCurrentTurn: () => {},
+    isIdle: () => true,
+    hasPendingMessages: () => false,
+    hasActiveTelegramTurn: () => false,
+    hasDispatchPending: () => false,
+    isCompactionInProgress: () => false,
+    setCompactionInProgress: () => {},
+    updateStatus: () => {
+      events.push("status");
+    },
+    dispatchNextQueuedTelegramTurn: () => {},
+    enqueueContinueTurn: async () => {},
+    compact: () => {},
+    enqueueControlItem: () => {},
+    showStatus: async () => {
+      events.push("show");
+    },
+    openModelMenu: async () => {},
+    openThinkingMenu: async () => {},
+    openQueueMenu: async () => {},
+    getAllowedUserId: () => allowedUserId,
+    setAllowedUserId: (userId: number) => {
+      allowedUserId = userId;
+      events.push(`pair:${userId}`);
+    },
+    registerBotCommands: async () => {
+      events.push("register");
+    },
+    persistConfig: async () => {
+      events.push("persist");
+    },
+    sendTextReply: async (_message: typeof message, text: string) => {
+      events.push(`reply:${text}`);
+    },
+  });
+
+  assert.equal(await handleCommand("start", message, {}), true);
+  assert.equal(allowedUserId, undefined);
+  assert.deepEqual(events, ["register", "show"]);
 });
 
 test("Command or prompt runtime routes commands before enqueue fallback", async () => {
@@ -913,18 +1394,60 @@ test("Command or prompt runtime routes commands before enqueue fallback", async 
       events.push(`command:${commandName ?? "none"}:${message.text}:${ctx.id}`);
       return commandName === "status";
     },
+    executeExtensionCommand: async (command, message, ctx) => {
+      events.push(
+        `extension:${command.name}:${command.args}:${message.text}:${ctx.id}`,
+      );
+      return command.name === "review";
+    },
+    expandPromptTemplateCommand: (commandName, args) =>
+      commandName === "review" ? `expanded:${args}` : undefined,
+    replaceMessageText: (message, text) => ({ ...message, text }),
     enqueueTurn: async (messages, ctx) => {
-      events.push(`enqueue:${messages.length}:${ctx.id}`);
+      events.push(`enqueue:${messages.length}:${messages[0]?.text}:${ctx.id}`);
     },
   });
   await runtime.dispatchMessages([{ text: "/status" }], { id: "ctx" });
+  await runtime.dispatchMessages([{ text: "/review staged" }], { id: "ctx" });
+  await runtime.dispatchMessages([{ text: "/fix_tests now" }], { id: "ctx" });
   await runtime.dispatchMessages([{ text: "hello" }], { id: "ctx" });
   await runtime.dispatchMessages([], { id: "ctx" });
   assert.deepEqual(events, [
     "command:status:/status:ctx",
+    "command:review:/review staged:ctx",
+    "extension:review:staged:/review staged:ctx",
+    "command:fix_tests:/fix_tests now:ctx",
+    "extension:fix_tests:now:/fix_tests now:ctx",
+    "enqueue:1:/fix_tests now:ctx",
     "command:none:hello:ctx",
-    "enqueue:1:ctx",
+    "enqueue:1:hello:ctx",
   ]);
+});
+
+test("Command or prompt runtime can ignore non-prompt message batches", async () => {
+  const events: string[] = [];
+  const runtime = createTelegramCommandOrPromptRuntime<
+    { text?: string; service?: boolean },
+    { id: string }
+  >({
+    extractRawText: (messages) =>
+      messages.map((message) => message.text ?? "").join(" "),
+    shouldIgnoreMessages: (messages) =>
+      messages.every((message) => message.service && !message.text),
+    handleCommand: async () => {
+      events.push("command");
+      return false;
+    },
+    replaceMessageText: (message, text) => ({ ...message, text }),
+    enqueueTurn: async (messages) => {
+      events.push(`enqueue:${messages.length}`);
+    },
+  });
+  await runtime.dispatchMessages([{ service: true }], { id: "ctx" });
+  await runtime.dispatchMessages([{ service: true, text: "hello" }], {
+    id: "ctx",
+  });
+  assert.deepEqual(events, ["command", "enqueue:1"]);
 });
 
 test("Command helpers execute command actions through provided handlers", async () => {
@@ -942,8 +1465,23 @@ test("Command helpers execute command actions through provided handlers", async 
     handleModel: async () => {
       events.push("model");
     },
+    handleThinking: async () => {
+      events.push("thinking");
+    },
     handleHelp: async (_message: unknown, commandName: "help" | "start") => {
       events.push(`help:${commandName}`);
+    },
+    handleAbort: async () => {
+      events.push("abort");
+    },
+    handleNext: async () => {
+      events.push("next");
+    },
+    handleContinue: async () => {
+      events.push("continue");
+    },
+    handleQueue: async () => {
+      events.push("queue");
     },
   };
   assert.equal(

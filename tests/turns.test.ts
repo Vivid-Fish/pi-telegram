@@ -16,6 +16,7 @@ import {
   createTelegramPromptTurnRuntimeBuilder,
   createTelegramQueuedPromptEditRuntime,
   formatTelegramTurnStatusSummary,
+  getTelegramVoiceReplyMode,
   truncateTelegramQueueSummary,
   updateQueuedTelegramPromptTurnText,
   updateTelegramPromptTurnText,
@@ -48,6 +49,75 @@ test("Turn helpers build prompt text with history and attachments", () => {
   assert.match(prompt, /1\. older message/);
   assert.match(prompt, /Current Telegram message:\ncurrent message/);
   assert.match(prompt, /\[attachments\] \/tmp\n- \/demo.png/);
+});
+
+test("Turn helpers omit [time] section by default", () => {
+  const prompt = buildTelegramTurnPrompt({
+    telegramPrefix: "[telegram]",
+    rawText: "hello",
+    files: [],
+  });
+  assert.equal(prompt, "[telegram] hello");
+});
+
+test("Turn helpers inject [time] as the final context section", () => {
+  const prompt = buildTelegramTurnPrompt({
+    telegramPrefix: "[telegram]",
+    rawText: "current message",
+    files: [{ path: "/tmp/demo.png", fileName: "demo.png", isImage: true }],
+    handlerOutputs: ["transcript"],
+    voiceContext: { "reply mode": "manual" },
+    timeLine: "2026-05-16 14:32:10 Europe/Berlin",
+  });
+  assert.match(
+    prompt,
+    /^\[telegram\] current message\n\n\[attachments\] \/tmp\n- \/demo\.png\n\n\[outputs\]\n- transcript\n\n\[voice\] reply mode: manual\n\n\[time\] 2026-05-16 14:32:10 Europe\/Berlin$/,
+  );
+});
+
+test("Turn helpers still inject [time] when raw text is empty", () => {
+  const prompt = buildTelegramTurnPrompt({
+    telegramPrefix: "[telegram]",
+    rawText: "",
+    files: [],
+    timeLine: "2026-05-16 14:32:10 UTC",
+  });
+  assert.equal(prompt, "[telegram]\n\n[time] 2026-05-16 14:32:10 UTC");
+});
+
+test("Turn runtime builder calls resolveTimeLine with chatId and embeds result", async () => {
+  const seen: number[] = [];
+  const buildTurn = createTelegramPromptTurnRuntimeBuilder({
+    allocateQueueOrder: () => 1,
+    downloadFile: async (_fileId, fileName) => `/tmp/${fileName}`,
+    resolveTimeLine: (chatId) => {
+      seen.push(chatId);
+      return "2026-05-16 14:32:10 UTC";
+    },
+  });
+  const turn = await buildTurn([
+    { message_id: 42, chat: { id: 7 }, text: "hi" },
+  ]);
+  assert.deepEqual(seen, [7]);
+  assert.match(
+    (turn.content[0] as { type: "text"; text: string }).text,
+    /\[time\] 2026-05-16 14:32:10 UTC/,
+  );
+});
+
+test("Turn runtime builder adds explicit thread attribute to Telegram prefix", async () => {
+  const buildTurn = createTelegramPromptTurnRuntimeBuilder({
+    allocateQueueOrder: () => 1,
+    downloadFile: async (_fileId, fileName) => `/tmp/${fileName}`,
+    getTelegramThreadLabel: () => "🧭 Axial|bad]name",
+  });
+  const turn = await buildTurn([
+    { message_id: 42, message_thread_id: 7, chat: { id: 7 }, text: "hi" },
+  ]);
+  assert.equal(
+    (turn.content[0] as { type: "text"; text: string }).text,
+    "[telegram|thread:🧭 Axial bad name] hi",
+  );
 });
 
 test("Turn helpers summarize text and attachment-only turns", () => {
@@ -154,7 +224,112 @@ test("Turn runtime builder injects Telegram reply context into prompt turns", as
   );
 });
 
-test("Turn runtime builder routes attachment handler output into prompt text", async () => {
+test("Turn runtime builder identifies forwarded messages from non-owner users", async () => {
+  const buildTurn = createTelegramPromptTurnRuntimeBuilder({
+    allocateQueueOrder: () => 1,
+    downloadFile: async (_fileId, fileName) => `/tmp/${fileName}`,
+    getAllowedUserId: () => 100,
+  });
+  const turn = await buildTurn([
+    {
+      message_id: 12,
+      chat: { id: 5 },
+      from: { id: 100, first_name: "Owner" },
+      forward_origin: {
+        type: "user",
+        sender_user: { id: 200, first_name: "Alice", username: "alice" },
+      },
+      text: "forwarded text",
+    },
+  ]);
+  assert.equal(
+    (turn.content[0] as { type: "text"; text: string }).text,
+    "[telegram]\n\n[forward|from:alice] forwarded text",
+  );
+});
+
+test("Turn runtime builder places replied-message attachments in source attachment context", async () => {
+  const buildTurn = createTelegramPromptTurnRuntimeBuilder({
+    allocateQueueOrder: () => 1,
+    downloadFile: async (_fileId, fileName) => `/tmp/${fileName}`,
+  });
+  const turn = await buildTurn([
+    {
+      message_id: 12,
+      chat: { id: 5 },
+      text: "look at this",
+      reply_to_message: {
+        message_id: 11,
+        from: { id: 200, first_name: "Alice" },
+        caption: "source image",
+        photo: [{ file_id: "photo-1", file_size: 100 }],
+      },
+    },
+  ]);
+  assert.equal(
+    (turn.content[0] as { type: "text"; text: string }).text,
+    "[telegram] look at this\n\n[reply|from:200] source image\n\n[attachments|from:200] /tmp\n- /photo-11.jpg",
+  );
+});
+
+test("Turn runtime builder keeps current attachments before source reply context", async () => {
+  const buildTurn = createTelegramPromptTurnRuntimeBuilder({
+    allocateQueueOrder: () => 1,
+    downloadFile: async (_fileId, fileName) => `/tmp/${fileName}`,
+  });
+  const turn = await buildTurn([
+    {
+      message_id: 12,
+      chat: { id: 5 },
+      text: "current",
+      document: { file_id: "doc-1", file_name: "mine.txt" },
+      reply_to_message: {
+        message_id: 11,
+        from: { id: 200, username: "alice" },
+        photo: [{ file_id: "photo-1", file_size: 100 }],
+      },
+    },
+  ]);
+  assert.equal(
+    (turn.content[0] as { type: "text"; text: string }).text,
+    [
+      "[telegram] current",
+      "",
+      "[attachments] /tmp",
+      "- /mine.txt",
+      "",
+      "[reply|from:alice]",
+      "",
+      "[attachments|from:alice] /tmp",
+      "- /photo-11.jpg",
+    ].join("\n"),
+  );
+});
+
+test("Turn runtime builder includes reply block for attachment-only replied messages", async () => {
+  const buildTurn = createTelegramPromptTurnRuntimeBuilder({
+    allocateQueueOrder: () => 1,
+    downloadFile: async (_fileId, fileName) => `/tmp/${fileName}`,
+  });
+  const turn = await buildTurn([
+    {
+      message_id: 12,
+      chat: { id: 5 },
+      text: "what is this?",
+      reply_to_message: {
+        message_id: 11,
+        from: { id: 200, username: "alice" },
+        photo: [{ file_id: "photo-1", file_size: 100 }],
+      },
+    },
+  ]);
+  assert.equal(
+    (turn.content[0] as { type: "text"; text: string }).text,
+    "[telegram] what is this?\n\n[reply|from:alice]\n\n[attachments|from:alice] /tmp\n- /photo-11.jpg",
+  );
+});
+
+test("Turn runtime builder routes inbound handler output into prompt text", async () => {
   const buildTurn = createTelegramPromptTurnRuntimeBuilder<
     {
       message_id: number;
@@ -191,6 +366,209 @@ test("Turn runtime builder routes attachment handler output into prompt text", a
   assert.equal(
     (turn.content[0] as { type: "text"; text: string }).text,
     "[telegram]\n\n[attachments] /tmp\n- /voice-12.ogg\n\n[outputs]\n- transcript from /work",
+  );
+});
+
+test("Turn runtime omits voice context when reply mode is only the implicit default", async () => {
+  const buildTurn = createTelegramPromptTurnRuntimeBuilder<
+    {
+      message_id: number;
+      chat: { id: number };
+      voice: { file_id: string; mime_type: string };
+    },
+    unknown
+  >({
+    allocateQueueOrder: () => 1,
+    downloadFile: async (_fileId, fileName) => `/tmp/${fileName}`,
+    getVoiceReplyMode: () => "manual",
+    isVoiceReplyModeConfigured: () => false,
+  });
+  const turn = await buildTurn([
+    {
+      message_id: 13,
+      chat: { id: 5 },
+      voice: { file_id: "voice-1", mime_type: "audio/ogg" },
+    },
+  ]);
+  assert.doesNotMatch(
+    (turn.content[0] as { type: "text"; text: string }).text,
+    /\[voice\]/,
+  );
+});
+
+test("Turn builder preserves topic thread target", async () => {
+  const turn = await buildTelegramPromptTurnRuntime({
+    telegramPrefix: "[telegram]",
+    messages: [{ message_id: 14, message_thread_id: 42, chat: { id: -1007 } }],
+    queueOrder: 1,
+    rawText: "hello",
+    files: [],
+    statusText: "hello",
+    inferImageMimeType: () => undefined,
+  });
+  assert.deepEqual(turn.target, { chatId: -1007, threadId: 42 });
+});
+
+test("Turn builder keeps private bot topic metadata out of prompt prefix", async () => {
+  const turn = await buildTelegramPromptTurnRuntime({
+    telegramPrefix: "[telegram]",
+    messages: [
+      {
+        message_id: 14,
+        message_thread_id: 42,
+        chat: { id: 7, type: "private" },
+      },
+    ],
+    queueOrder: 1,
+    rawText: "hello",
+    files: [],
+    statusText: "hello",
+    inferImageMimeType: () => undefined,
+  });
+  assert.equal(
+    (turn.content[0] as { type: "text"; text: string }).text,
+    "[telegram] hello",
+  );
+});
+
+test("Turn builder keeps group topic metadata out of prompt prefix", async () => {
+  const turn = await buildTelegramPromptTurnRuntime({
+    telegramPrefix: "[telegram]",
+    messages: [
+      {
+        message_id: 14,
+        message_thread_id: 42,
+        chat: { id: -1007, type: "supergroup" },
+      },
+    ],
+    queueOrder: 1,
+    rawText: "hello",
+    files: [],
+    statusText: "hello",
+    inferImageMimeType: () => undefined,
+  });
+  assert.equal(
+    (turn.content[0] as { type: "text"; text: string }).text,
+    "[telegram] hello",
+  );
+});
+
+test("Voice reply mode tags turn when voice file present and mode is mirror", async () => {
+  const turn = await buildTelegramPromptTurnRuntime({
+    telegramPrefix: "[telegram]",
+    messages: [{ message_id: 14, chat: { id: 5 } }],
+    queueOrder: 1,
+    rawText: "transcribed voice message",
+    files: [
+      {
+        path: "/tmp/voice-14.ogg",
+        fileName: "voice-14.ogg",
+        mimeType: "audio/ogg",
+        kind: "voice" as import("../lib/media.ts").TelegramAttachmentKind,
+        isImage: false,
+      },
+    ],
+    statusText: "transcribed voice message",
+    inferImageMimeType: () => undefined,
+    voiceReplyMode: "mirror",
+  });
+  assert.equal(turn.voiceReplyPreferred, true);
+  assert.equal(turn.voiceReplyRequired, false);
+  assert.match(
+    (turn.content[0] as { type: "text"; text: string }).text,
+    /\[voice\] reply mode: mirror/,
+  );
+});
+
+test("Voice reply mode tags turn with voice-required when mode is always", async () => {
+  const turn = await buildTelegramPromptTurnRuntime({
+    telegramPrefix: "[telegram]",
+    messages: [{ message_id: 15, chat: { id: 5 } }],
+    queueOrder: 1,
+    rawText: "hello",
+    files: [],
+    statusText: "hello",
+    inferImageMimeType: () => undefined,
+    voiceReplyMode: "always",
+  });
+  assert.equal(turn.voiceReplyPreferred, false);
+  assert.equal(turn.voiceReplyRequired, true);
+  assert.match(
+    (turn.content[0] as { type: "text"; text: string }).text,
+    /\[voice\] reply mode: always/,
+  );
+});
+
+test("Voice reply mode mirror with no voice file stays on the manual text path", async () => {
+  const turn = await buildTelegramPromptTurnRuntime({
+    telegramPrefix: "[telegram]",
+    messages: [{ message_id: 17, chat: { id: 5 } }],
+    queueOrder: 1,
+    rawText: "hello",
+    statusText: "hello",
+    files: [],
+    inferImageMimeType: () => undefined,
+    voiceReplyMode: "mirror",
+  });
+  assert.equal(turn.voiceReplyPreferred, false);
+  assert.equal(turn.voiceReplyRequired, false);
+  assert.doesNotMatch(
+    (turn.content[0] as { type: "text"; text: string }).text,
+    /\[voice\]/,
+  );
+});
+
+test("Voice reply mode always with voice file present sets voiceReplyRequired only", async () => {
+  const turn = await buildTelegramPromptTurnRuntime({
+    telegramPrefix: "[telegram]",
+    messages: [{ message_id: 18, chat: { id: 5 } }],
+    queueOrder: 1,
+    rawText: "transcribed voice",
+    statusText: "transcribed voice",
+    files: [
+      {
+        path: "/tmp/voice.ogg",
+        fileName: "voice.ogg",
+        mimeType: "audio/ogg",
+        kind: "voice" as import("../lib/media.ts").TelegramAttachmentKind,
+        isImage: false,
+      },
+    ],
+    inferImageMimeType: () => undefined,
+    voiceReplyMode: "always",
+  });
+  assert.equal(turn.voiceReplyPreferred, false);
+  assert.equal(turn.voiceReplyRequired, true);
+  assert.match(
+    (turn.content[0] as { type: "text"; text: string }).text,
+    /\[voice\] reply mode: always/,
+  );
+});
+
+test("Turn runtime tags manual mode without voice flags", async () => {
+  const turn = await buildTelegramPromptTurnRuntime({
+    telegramPrefix: "[telegram]",
+    messages: [{ message_id: 16, chat: { id: 5 } }],
+    queueOrder: 1,
+    rawText: "hello",
+    statusText: "hello",
+    files: [
+      {
+        path: "/tmp/voice.ogg",
+        fileName: "voice.ogg",
+        mimeType: "audio/ogg",
+        kind: "voice" as import("../lib/media.ts").TelegramAttachmentKind,
+        isImage: false,
+      },
+    ],
+    inferImageMimeType: () => undefined,
+    voiceReplyMode: "manual",
+  });
+  assert.equal(turn.voiceReplyPreferred, false);
+  assert.equal(turn.voiceReplyRequired, false);
+  assert.match(
+    (turn.content[0] as { type: "text"; text: string }).text,
+    /\[voice\] reply mode: manual/,
   );
 });
 
@@ -440,6 +818,31 @@ test("Turn helpers preserve abort-history prompt context when queued turns are e
   assert.equal(updated.statusSummary, "new current");
 });
 
+test("Turn edit preserves voice reply tags", () => {
+  const turn = {
+    kind: "prompt" as const,
+    chatId: 1,
+    replyToMessageId: 10,
+    sourceMessageIds: [10],
+    queueOrder: 1,
+    queueLane: "default" as const,
+    laneOrder: 1,
+    queuedAttachments: [],
+    content: [{ type: "text" as const, text: "hello" }],
+    historyText: "hello",
+    statusSummary: "hello",
+    voiceReplyPreferred: true,
+    voiceReplyRequired: false,
+  };
+  const updated = updateTelegramPromptTurnText({
+    turn,
+    telegramPrefix: "[telegram]",
+    rawText: "edited",
+  });
+  assert.equal(updated.voiceReplyPreferred, true);
+  assert.equal(updated.voiceReplyRequired, false);
+});
+
 test("Turn helpers assemble prompt turns with text, ids, history, and image payloads", async () => {
   const turn = await buildTelegramPromptTurn({
     telegramPrefix: "[telegram]",
@@ -500,4 +903,49 @@ test("Turn helpers assemble prompt turns with text, ids, history, and image payl
     data: Buffer.from([1, 2, 3]).toString("base64"),
     mimeType: "image/png",
   });
+});
+
+test("getTelegramVoiceReplyMode returns default when no config provided", () => {
+  assert.equal(getTelegramVoiceReplyMode(), "manual");
+  assert.equal(getTelegramVoiceReplyMode(undefined), "manual");
+});
+
+test("getTelegramVoiceReplyMode reads frozen config with valid replyMode", () => {
+  const frozenConfig = Object.freeze({
+    voice: { replyMode: "always" as const },
+  });
+  assert.equal(getTelegramVoiceReplyMode(frozenConfig), "always");
+});
+
+test("getTelegramVoiceReplyMode ignores frozen config with invalid replyMode", () => {
+  const frozenConfig = Object.freeze({
+    voice: { replyMode: "bad-mode" as any },
+  });
+  assert.equal(getTelegramVoiceReplyMode(frozenConfig), "manual");
+});
+
+test("getTelegramVoiceReplyMode reads config voice.replyMode", () => {
+  assert.equal(
+    getTelegramVoiceReplyMode({ voice: { replyMode: "mirror" } }),
+    "mirror",
+  );
+  assert.equal(
+    getTelegramVoiceReplyMode({ voice: { replyMode: "always" } }),
+    "always",
+  );
+  assert.equal(
+    getTelegramVoiceReplyMode({ voice: { replyMode: "manual" } }),
+    "manual",
+  );
+});
+
+test("getTelegramVoiceReplyMode falls back to manual for invalid or missing config", () => {
+  assert.equal(
+    getTelegramVoiceReplyMode({ voice: { replyMode: "invalid" as any } }),
+    "manual",
+  );
+  assert.equal(getTelegramVoiceReplyMode({ voice: {} }), "manual");
+  assert.equal(getTelegramVoiceReplyMode({}), "manual");
+  assert.equal(getTelegramVoiceReplyMode(null as any), "manual");
+  assert.equal(getTelegramVoiceReplyMode(undefined), "manual");
 });

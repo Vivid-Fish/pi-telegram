@@ -6,6 +6,7 @@
 
 import type {
   AgentEndEvent,
+  AgentSettledEvent,
   AgentStartEvent,
   BeforeAgentStartEvent,
   ExtensionAPI,
@@ -96,6 +97,7 @@ export interface TelegramLifecycleRegistrationDeps {
     ctx: ExtensionContext,
   ) => Promise<void>;
   onAgentEnd: (event: AgentEndEvent, ctx: ExtensionContext) => Promise<void>;
+  onAgentSettled: (event: AgentSettledEvent, ctx: ExtensionContext) => Promise<void>;
 }
 
 export interface TelegramSessionLifecycleHooks {
@@ -356,5 +358,12 @@ export function registerTelegramLifecycleHooks(
   });
   pi.on("agent_end", async (event, ctx) => {
     await deps.onAgentEnd(event, ctx);
+  });
+  const onAgentSettled = pi.on as unknown as (
+    event: "agent_settled",
+    handler: (event: AgentSettledEvent, ctx: ExtensionContext) => Promise<void>,
+  ) => void;
+  onAgentSettled("agent_settled", async (event, ctx) => {
+    await deps.onAgentSettled(event, ctx);
   });
 }

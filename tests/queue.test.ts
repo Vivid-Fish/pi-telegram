@@ -27,6 +27,7 @@ import {
   createTelegramActiveTurnStore,
   createTelegramAgentEndHook,
   createTelegramAgentLifecycleHooks,
+  createTelegramAgentSettledHook,
   createTelegramAgentStartHook,
   createTelegramControlItemBuilder,
   createTelegramControlQueueController,
@@ -2009,6 +2010,31 @@ test("Agent end hook binds assistant extraction and runtime ports", async () => 
     "preview:final",
     "finalize:final",
     "attachments",
+    "dispatch:ctx",
+  ]);
+});
+
+test("Agent settled hook clears stale active Telegram state and dispatches next", async () => {
+  const events: string[] = [];
+  const turn = createQueueTestPromptTurn();
+  const hook = createTelegramAgentSettledHook<PendingTelegramTurn, { id: string }>({
+    getActiveTurn: () => turn,
+    resetRuntimeState: () => events.push("reset"),
+    clearPreview: async (chatId) => events.push(`clear:${chatId}`),
+    updateStatus: (ctx) => events.push(`status:${ctx.id}`),
+    dispatchNextQueuedTelegramTurn: (ctx) => events.push(`dispatch:${ctx.id}`),
+    requestDeferredDispatchNextQueuedTelegramTurn: (dispatch) => {
+      setTimeout(() => dispatch({ id: "ctx" }), 0);
+    },
+  });
+
+  await hook({ type: "agent_settled" }, { id: "ctx" });
+  assert.deepEqual(events, ["reset", `clear:${turn.chatId}`, "status:ctx"]);
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.deepEqual(events, [
+    "reset",
+    `clear:${turn.chatId}`,
+    "status:ctx",
     "dispatch:ctx",
   ]);
 });

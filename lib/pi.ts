@@ -33,6 +33,11 @@ export type {
   SlashCommandInfo,
 };
 
+/** Pi 0.80+ emits this event, while older SDK type packages do not declare it. */
+export interface AgentSettledEvent {
+  type: "agent_settled";
+}
+
 export interface ToolExecutionStartEvent {
   type: "tool_execution_start";
   toolCallId: string;

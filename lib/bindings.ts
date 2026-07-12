@@ -548,6 +548,7 @@ export function registerTelegramLifecycleRuntimeHooks({
       agentLifecycleHooks.onToolExecutionEnd(_event, ctx);
     },
     onAgentEnd: agentLifecycleHooks.onAgentEnd,
+    onAgentSettled: agentLifecycleHooks.onAgentSettled,
     onBeforeAgentStart: Prompts.createTelegramProactiveBeforeAgentStartHook({
       isConfigured: configStore.hasBotToken,
       isProactivePushEnabled,

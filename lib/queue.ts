@@ -799,7 +799,38 @@ export function createTelegramAgentLifecycleHooks<
       TMessage,
       TReplyMarkup
     >(deps),
+    onAgentSettled: createTelegramAgentSettledHook<TTurn, TContext>(deps),
     ...createTelegramToolExecutionHooks<TContext>(deps),
+  };
+}
+
+export function createTelegramAgentSettledHook<
+  TTurn extends PendingTelegramTurn,
+  TContext,
+>(
+  deps: Pick<
+    TelegramAgentEndHookRuntimeDeps<TTurn, TContext, unknown>,
+    | "getActiveTurn"
+    | "resetRuntimeState"
+    | "clearPreview"
+    | "updateStatus"
+    | "requestDeferredDispatchNextQueuedTelegramTurn"
+    | "dispatchNextQueuedTelegramTurn"
+  >,
+) {
+  return async (_event: unknown, ctx: TContext): Promise<void> => {
+    const turn = deps.getActiveTurn();
+    const hadActiveTurn = !!turn;
+    deps.resetRuntimeState();
+    if (turn) {
+      await deps.clearPreview(turn.chatId, { target: turn.target });
+    }
+    deps.updateStatus(ctx);
+    if (hadActiveTurn) {
+      deps.requestDeferredDispatchNextQueuedTelegramTurn(
+        deps.dispatchNextQueuedTelegramTurn,
+      );
+    }
   };
 }
 

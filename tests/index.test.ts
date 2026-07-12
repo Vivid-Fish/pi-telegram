@@ -97,6 +97,7 @@ test("Extension entrypoint wires domain bindings into the pi API", () => {
       "message_start",
       "message_update",
       "agent_end",
+      "agent_settled",
     ],
   );
 });

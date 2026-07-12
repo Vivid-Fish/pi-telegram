@@ -402,6 +402,9 @@ test("Lifecycle helpers register pi hooks and delegate to handlers", async () =>
     onAgentEnd: async () => {
       events.push("agent-end");
     },
+    onAgentSettled: async () => {
+      events.push("agent-settled");
+    },
   });
   assert.deepEqual(
     [...harness.handlers.keys()],
@@ -419,6 +422,7 @@ test("Lifecycle helpers register pi hooks and delegate to handlers", async () =>
       "message_start",
       "message_update",
       "agent_end",
+      "agent_settled",
     ],
   );
   const ctx = createLifecycleContext();
